@@ -1102,6 +1102,23 @@ function updateExportPreview() {
 // ============================================
 // EXPORT
 // ============================================
+
+/**
+ * BUG-6 #6.3 (2026-07-07): pure, regression-gated builder for the export toast.
+ * Kept a top-level pure function (no closure/DOM deps) so the message format —
+ * which must truthfully surface out-of-radius discards — is unit-testable without
+ * driving the async export flow (tests/run-export-toast-message-bug6-node.mjs).
+ *
+ * @param {number} written   POST-filter rows actually written to the CSV
+ * @param {number} discarded rows dropped for being out of radius (0 if none)
+ * @returns {string} toast message
+ */
+function buildExportToastMessage(written, discarded) {
+    return discarded > 0
+        ? `📤 Exported ${written} records (${discarded} discarded out of radius)`
+        : `📤 Exported ${written} records`;
+}
+
 async function exportCSV() {
     showLoading('Exporting CSV...');
     try {
@@ -1111,7 +1128,13 @@ async function exportCSV() {
             if (response.csv) {
                 downloadFile(response.csv, `ghost_map_export_${Date.now()}.csv`, 'text/csv');
             }
-            showToast(`📤 Exported ${response.count || state.stats.total} records`, 'success');
+            // BUG-6: `count` is the POST-filter row total (rows actually in the
+            // CSV). Use ?? not || so a truthful 0 (every row dropped) isn't
+            // silently replaced by the pre-filter stat. When rows were dropped
+            // for being out of radius, tell the user how many.
+            const written = response.count ?? state.stats.total;
+            const discarded = response.discarded || 0;
+            showToast(buildExportToastMessage(written, discarded), 'success');
         } else {
             throw new Error(response?.error || 'Export failed');
         }

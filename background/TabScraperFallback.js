@@ -23,7 +23,7 @@
  */
 
 import { CONFIG } from '../lib/config.js';
-import { extractPartitaIva } from '../lib/partitaIva.js';
+import { extractPartitaIvaWithRaw } from '../lib/partitaIva.js';
 import { logger, sleep } from '../lib/utils.js';
 import { getStatistics } from '../lib/Statistics.js';
 // §3.D.3 CYCLE BREAK (2026-06-11): this module must NOT import the
@@ -627,7 +627,7 @@ export async function scrapeWithTab(business, options = {}) {
     let tab = null;
     const foundEmails = new Set();
     let socialLinks = {};
-    let italianTaxCodes = { partitaIva: null, codiceFiscale: null };  // ITALIAN B2B FEATURE
+    let italianTaxCodes = { partitaIva: null, partitaIvaRaw: null, codiceFiscale: null };  // ITALIAN B2B FEATURE
     let successfulPage = null;
 
     try {
@@ -752,6 +752,11 @@ export async function scrapeWithTab(business, options = {}) {
                         if (result.italianTaxCodes.partitaIva && !italianTaxCodes.partitaIva) {
                             italianTaxCodes.partitaIva = result.italianTaxCodes.partitaIva;
                             logger.info(`[TAB] ✓ Found P.IVA: ${italianTaxCodes.partitaIva}`);
+                        }
+                        // BUG-8 #8.1: carry the first rejected raw candidate too (only
+                        // meaningful until a valid P.IVA is found on some page).
+                        if (result.italianTaxCodes.partitaIvaRaw && !italianTaxCodes.partitaIva && !italianTaxCodes.partitaIvaRaw) {
+                            italianTaxCodes.partitaIvaRaw = result.italianTaxCodes.partitaIvaRaw;
                         }
                         if (result.italianTaxCodes.codiceFiscale && !italianTaxCodes.codiceFiscale) {
                             italianTaxCodes.codiceFiscale = result.italianTaxCodes.codiceFiscale;
@@ -983,6 +988,36 @@ async function navigateToPage(tabId, url, config) {
 }
 
 /**
+ * BUG-8 #8.1 (A1, 2026-07-07): extract Italian tax codes from page TEXT in the
+ * SERVICE-WORKER context.
+ *
+ * The DOM-extraction function (extractEmailsFromDOM) is serialized and injected
+ * into the PAGE realm by chrome.scripting.executeScript, where module imports are
+ * NOT in scope — so calling the SSOT extractPartitaIvaWithRaw() there threw a
+ * ReferenceError (swallowed by the injected try/catch), silently killing the whole
+ * tab-path P.IVA/C.F. feature and starving BUG-8's raw column for JS-rendered /
+ * failed-static-fetch sites. Fix: the injected function returns the page text and
+ * this helper runs the real, checksum-validated extraction back in the SW where
+ * lib/partitaIva.js resolves. Keeps the P.IVA SSOT intact (no re-triplication).
+ *
+ * @param {string|any} text page innerText handed back from the injected function
+ * @returns {{partitaIva: string|null, partitaIvaRaw: string|null, codiceFiscale: string|null}}
+ */
+export function extractTaxCodesFromText(text) {
+    if (!text || typeof text !== 'string') {
+        return { partitaIva: null, partitaIvaRaw: null, codiceFiscale: null };
+    }
+    const piva = extractPartitaIvaWithRaw(text);
+    // Codice Fiscale (16-char personal / 11-digit company shares the P.IVA form).
+    // Same regex used by offscreen/parser.js and background/index.js.
+    let codiceFiscale = null;
+    const cfPattern = /(?:C\.?\s*F\.?|Codice\s*Fiscale|Fiscal\s*Code)[:\s]*([A-Z]{6}\d{2}[A-EHLMPR-T]\d{2}[A-Z]\d{3}[A-Z])\b/gi;
+    const cfMatch = cfPattern.exec(text.toUpperCase());
+    if (cfMatch && cfMatch[1]) codiceFiscale = cfMatch[1].toUpperCase();
+    return { partitaIva: piva.partitaIva, partitaIvaRaw: piva.partitaIvaRaw, codiceFiscale };
+}
+
+/**
  * Extract emails from a tab's rendered DOM
  * @param {number} tabId - Tab ID to extract from
  * @param {string} url - Current URL (for context)
@@ -999,7 +1034,15 @@ async function extractEmailsFromTab(tabId, url, config) {
         });
 
         if (results && results[0] && results[0].result) {
-            return results[0].result;
+            const r = results[0].result;
+            // BUG-8 #8.1 (A1): the injected function runs in the page realm and
+            // cannot import the P.IVA SSOT, so it hands back the page text and we
+            // extract tax codes HERE (SW context) where the import resolves.
+            if (typeof r.pageText === 'string') {
+                r.italianTaxCodes = extractTaxCodesFromText(r.pageText);
+                delete r.pageText;
+            }
+            return r;
         }
 
         return { emails: [], socialLinks: {} };
@@ -1025,7 +1068,9 @@ async function extractEmailsFromTab(tabId, url, config) {
 function extractEmailsFromDOM(emailPatternSource, blacklist) {
     const emails = new Set();
     const socialLinks = {};
-    const italianTaxCodes = { partitaIva: null, codiceFiscale: null };
+    // BUG-8 #8.1 (A1): tax-code extraction moved to the SW (extractTaxCodesFromText);
+    // this injected function only harvests the page text for it.
+    let pageText = '';
 
     // FIX: Valid TLDs sorted by length descending to prevent truncation (e.g., .com → .co)
     const VALID_TLDS = ['info', 'name', 'tech', 'shop', 'site', 'com', 'org', 'net', 'biz', 'pro', 'app', 'dev', 'it', 'de', 'fr', 'es', 'uk', 'eu', 'io', 'co', 'me', 'tv'];
@@ -1205,23 +1250,18 @@ function extractEmailsFromDOM(emailPatternSource, blacklist) {
         }
 
         // ═══════════════════════════════════════════════════
-        // 5. ITALIAN B2B FEATURE: Extract Partita IVA and Codice Fiscale
+        // 5. ITALIAN B2B FEATURE: hand the page text back to the SW.
         // ═══════════════════════════════════════════════════
-        const fullText = bodyText + ' ' + html;
-
-        // Partita IVA — shared SSOT (lib/partitaIva.js): checksum-validated, handles
-        // composite labels like "P.IVA/C.F. NNN" / "Cod.Fisc./Part.IVA/... NNN".
-        italianTaxCodes.partitaIva = extractPartitaIva(fullText);
-        if (italianTaxCodes.partitaIva) console.log('[Ghost Map Tab] ✓ Found P.IVA:', italianTaxCodes.partitaIva);
-
-        // Codice Fiscale pattern (16 alphanumeric chars)
-        const cfPattern = /(?:C\.?\s*F\.?|Codice\s*Fiscale|Fiscal\s*Code)[:\s]*([A-Z]{6}\d{2}[A-EHLMPR-T]\d{2}[A-Z]\d{3}[A-Z])\b/gi;
-        cfPattern.lastIndex = 0;
-        const cfMatch = cfPattern.exec(fullText.toUpperCase());
-        if (cfMatch && cfMatch[1]) {
-            italianTaxCodes.codiceFiscale = cfMatch[1].toUpperCase();
-            console.log('[Ghost Map Tab] ✓ Found C.F.:', cfMatch[1]);
-        }
+        // BUG-8 #8.1 (A1): this function is INJECTED into the page realm, where
+        // module imports (the P.IVA SSOT) are NOT in scope — calling them here
+        // threw a swallowed ReferenceError and killed the tax-code feature. We now
+        // return the page text and let extractTaxCodesFromText() run the real,
+        // checksum-validated extraction (P.IVA + raw candidate + C.F.) back in the
+        // service worker. We return only innerText (`bodyText`), NOT innerHTML:
+        // the visible footer carries P.IVA/C.F., innerText is far smaller than the
+        // markup, and P.IVA-in-markup is already covered by the offscreen parser
+        // path. Bounded so a pathological page can't bloat the executeScript reply.
+        pageText = bodyText.slice(0, 200000);
 
     } catch (error) {
         console.error('[Ghost Map] DOM extraction error:', error);
@@ -1230,7 +1270,7 @@ function extractEmailsFromDOM(emailPatternSource, blacklist) {
     return {
         emails: Array.from(emails),
         socialLinks,
-        italianTaxCodes
+        pageText
     };
 }
 

@@ -19,7 +19,12 @@ import {
     getBusinessesForEmailScraping,
     getBusinessesWithoutWebsite,
     getFailedBusinesses,  // P3-002 FIX: Added for retry functionality
-    updateBusiness,
+    // BUG-4 (2026-07-07): atomic read-modify-write helpers replace the
+    // stale-snapshot full puts (retry-failed reset, invalid-URL back-fill) and
+    // the frozen-snapshot DLQ drain, none of which may regress concurrent
+    // enrichment. See lib/db.js updateBusinessMerge / saveBusinessFillHoles.
+    updateBusinessMerge,
+    saveBusinessFillHoles,
     getStats,
     clearAllBusinesses,
     deleteBusiness,  // BROKEN CODE FIX: Added for storage-modal delete functionality
@@ -29,12 +34,16 @@ import {
     getOldBusinessIds
 } from '../lib/db.js';
 import { sitemapDiscovery } from '../lib/SitemapDiscovery.js';
+// BUG-7 (2026-07-07): shared invalid-URL skip marker + patch builder, so the
+// producer here, the retry-set filter (getFailedBusinessesFromDB) and the export
+// status (data-exporter.deriveScrapeStatus) key off ONE constant.
+import { buildInvalidUrlSkipUpdate, SKIPPED_INVALID_URL } from '../lib/businessUpdates.js';
 import { normalizeGoogleMapsUrl, getCanonicalDbKey } from '../lib/urlNormalizer.js';
 import { enrichmentRetryQueue } from '../lib/enrichmentRetryQueue.js';
 // SAVE-DLQ (2026-05-28): dead-letter recovery for save failures that survive the
 // in-process retry in db.saveBusiness. See docs/feature/fix-area-search-save-error-swallow/rca.md.
 import { enqueueDeadLetter, drainDeadLetter, getDeadLetterCount } from '../lib/saveDeadLetter.js';
-import { extractPartitaIva } from '../lib/partitaIva.js';
+import { extractPartitaIvaWithRaw } from '../lib/partitaIva.js';
 import { syncToOpportuni } from '../lib/opportuni-auth.js';
 import {
     logger,
@@ -98,7 +107,10 @@ import { container } from '../lib/ServiceContainer.js';
 import { robotsCompliance } from '../lib/RobotsCompliance.js';
 import { validateMessageSender } from './message-validator.js';
 // Step 03-03: Safe merge to prevent prototype pollution on selector config
-import { safeMerge, fillHolesMerge } from '../lib/sanitize.js';
+import { safeMerge, fillHolesPatch } from '../lib/sanitize.js';
+// BUG-4 inverse (2026-07-07): enrichment per-field merge policy, applied inside
+// the atomic updateBusinessMerge tx so it never regresses concurrent writes.
+import { computeEnrichmentPatch } from '../lib/enrichmentMerge.js';
 // Step 03-04: Coordinated infrastructure shutdown
 import { shutdownInfrastructure } from '../lib/infrastructure.js';
 // DEBT-3 (2026-05-27): `circuitBreaker` is now an explicit frozen
@@ -904,7 +916,11 @@ async function handleMessage(message, sender) {
             // Single-attempt (retry:false), budgeted inside drainDeadLetter so a
             // large queue can't stall. Mirrors retry_failed_businesses below.
             case 'drain_save_dead_letter': {
-                const result = await drainDeadLetter((b) => saveBusiness(b, { retry: false }));
+                // BUG-4: fill-holes merge — re-save each frozen DLQ snapshot
+                // without clobbering fields later runs enriched onto that URL.
+                // Single-attempt by design (no retry loop), matching the old
+                // {retry:false} budget semantics of the drain.
+                const result = await drainDeadLetter((b) => saveBusinessFillHoles(b));
                 const remaining = await getDeadLetterCount();
                 logger.info(`[DLQ] Manual drain: recovered ${result.drained}, ${remaining} remaining`);
                 return { ...result, remaining };
@@ -924,12 +940,13 @@ async function handleMessage(message, sender) {
 
                     // Reset their error state and queue for re-scraping
                     for (const business of failedBusinesses) {
-                        // Reset error state - updateBusiness expects object with googleMapsUrl
-                        await updateBusiness({
-                            ...business,
+                        // BUG-4: atomic merge — reset only the retry flags on the
+                        // CURRENT record; a full put of the (possibly minutes-old)
+                        // `business` snapshot would regress concurrent enrichment.
+                        await updateBusinessMerge(business.googleMapsUrl, {
                             emailScraped: false,
                             scrapeError: null
-                        });
+                        }, business);
 
                         // Add to job queue if has website.
                         // 2026-05-15 FIX: same conversion as addEmailJob —
@@ -1459,12 +1476,20 @@ async function handleBusinessFound(business) {
             // saves each card during scroll, so area-search's later save (carrying
             // the radius stamp searchCenterLat/Lon/RadiusKm) hit this branch and
             // was discarded 79/79. Now a later save back-fills only the holes;
-            // populated fields are never overwritten. Guarded by `changed` so the
-            // hot path (same card re-fires business_found many times per scroll)
-            // does NOT write when there is nothing new.
-            const { merged, changed } = fillHolesMerge(existing, business, ['googleMapsUrl']);
-            if (changed) {
-                await saveBusiness(merged);
+            // populated fields are never overwritten.
+            //
+            // BUG-4 inverse (2026-07-07): this was `fillHolesMerge(existing,…)` +
+            // `saveBusiness(merged)` — a read outside the tx then a full put, which
+            // could regress a field the email-scraper/enrichment wrote between the
+            // read and the put. Now the patch is computed against the CURRENT
+            // record INSIDE `updateBusinessMerge`'s readwrite tx. An empty patch
+            // (nothing new) issues no write — preserving the hot-path skip the old
+            // `changed` guard provided (same card re-fires many times per scroll).
+            const wroteKey = await updateBusinessMerge(
+                dbKey,
+                (current) => fillHolesPatch(current, business, ['googleMapsUrl'])
+            );
+            if (wroteKey) {
                 logger.debug('[BUSINESS] Duplicate back-filled (fill-holes):', business.title);
                 return { status: 'duplicate', merged: true, id: normalizedUrl };
             }
@@ -1472,9 +1497,27 @@ async function handleBusinessFound(business) {
             return { status: 'duplicate', id: normalizedUrl };
         }
 
-        // Save to database
-        await saveBusiness(business);
-        logger.info('[BUSINESS] Saved:', business.title);
+        // Save to database.
+        // BUG-4 #4.2 (2026-07-07): the `existing` lookup above is OUTSIDE any tx,
+        // so a concurrent writer (another observer save of the same card) could
+        // insert this row between the read and the write. A full-put here would
+        // clobber that concurrent insert. Persist through the SAME atomic
+        // read-modify-write the duplicate branch uses: inside the readwrite tx it
+        // re-reads the row and, if it now EXISTS (raced), fill-holes merges (never
+        // clobbers a populated field); if still absent, the `{}` fallback base
+        // makes fillHolesPatch emit every field → a clean insert. DLQ-on-failure
+        // is unchanged (the caller enqueues on throw, background/index.js).
+        const wroteKey = await updateBusinessMerge(
+            dbKey,
+            (current) => fillHolesPatch(current, business, ['googleMapsUrl']),
+            {}
+        );
+        // BUG-4 #4.2 (stats honesty): if a concurrent writer inserted this row
+        // between the outer read and the inner tx, fillHolesPatch found nothing to
+        // fill → no write (wroteKey === null). Report that as a duplicate so
+        // handleBusinessBatch's saved/duplicate counters stay truthful.
+        const inserted = wroteKey != null;
+        logger.info(inserted ? '[BUSINESS] Saved:' : '[BUSINESS] Raced to existing (no-op):', business.title);
         logger.info('[STEP 3] Email saved. Moving to next job...');
 
         // v9.10: post-save retry-queue drain. If a business_enrichment for
@@ -1500,7 +1543,7 @@ async function handleBusinessFound(business) {
         }
         */
 
-        return { status: 'saved', id: normalizedUrl };
+        return { status: inserted ? 'saved' : 'duplicate', id: normalizedUrl };
 
     } catch (error) {
         logger.error('[BUSINESS] Failed to save:', error);
@@ -1589,74 +1632,28 @@ async function handleBusinessEnrichment(payload) {
  */
 async function _doEnrichmentMerge(existing, fields, dbKey) {
     const f = fields || {};
-    const merged = { ...existing };
-    if (!merged.placeId && f.placeId) merged.placeId = f.placeId;
-    if (!merged.description && f.description) merged.description = f.description;
-    if ((!merged.claimStatus || merged.claimStatus === 'unknown') && f.claimStatus && f.claimStatus !== 'unknown') {
-        merged.claimStatus = f.claimStatus;
-    }
-    if (!merged.lastUpdatedByOwner && f.lastUpdatedByOwner) {
-        merged.lastUpdatedByOwner = f.lastUpdatedByOwner;
-    }
-    if (Array.isArray(f.reviewThemes) && f.reviewThemes.length > 0) {
-        const existingCount = Array.isArray(merged.reviewThemes) ? merged.reviewThemes.length : 0;
-        if (f.reviewThemes.length >= existingCount) {
-            merged.reviewThemes = f.reviewThemes;
-        }
-    }
-    if (f.reviewDistribution && typeof f.reviewDistribution === 'object') {
-        const sum = (d) => Object.values(d || {}).reduce((a, b) => a + (Number(b) || 0), 0);
-        if (sum(f.reviewDistribution) >= sum(merged.reviewDistribution)) {
-            merged.reviewDistribution = f.reviewDistribution;
-        }
-    }
-    if (!merged.phone && f.phone) merged.phone = f.phone;
-    if (!merged.address && f.address) merged.address = f.address;
-    if (!merged.website && f.website) merged.website = f.website;
-    // EXP-01 FIX (2026-06-10): fill latitude/longitude holes from the
-    // enrichment (observer propagates the card-URL coords). Pre-fix these
-    // never merged, so only ~21% of rows (JSPB state catalog) had coords and
-    // the export radius filter ran fail-open on the rest. Type+range
-    // validated here too — different trust boundary than the content script.
-    if (merged.latitude == null && typeof f.latitude === 'number'
-        && Number.isFinite(f.latitude) && Math.abs(f.latitude) <= 90) {
-        merged.latitude = f.latitude;
-    }
-    if (merged.longitude == null && typeof f.longitude === 'number'
-        && Number.isFinite(f.longitude) && Math.abs(f.longitude) <= 180) {
-        merged.longitude = f.longitude;
-    }
-    if ((merged.rating == null || merged.rating === '') && f.rating != null) {
-        merged.rating = f.rating;
-    }
-    // v9.12 Wave 1.1 (2026-05-08): reviewCount captured by anchor-based rating
-    // regex, paired with rating in pb (rating,reviewCount tuple).
-    // DEBT-CSV-1 (2026-06-11): now reachable (observer forwards the field).
-    // Type-validated like EXP-01 lat/lng above — same trust boundary (the
-    // MAIN-world postMessage bridge is page-forgeable, and reviewCount lands
-    // UNESCAPED in the CSV Reviews cell, so a non-numeric value would be a
-    // formula-injection vector).
-    if ((merged.reviewCount == null || merged.reviewCount === '') && f.reviewCount != null
-        && typeof f.reviewCount === 'number' && Number.isFinite(f.reviewCount) && f.reviewCount >= 0) {
-        merged.reviewCount = f.reviewCount;
-    }
-    // v9.12 Wave 1: hours raw from /maps/preview/place pb response. Telemetry
-    // tracks parse hit rate so smoke run reveals if the regex pattern matches
-    // real Maps responses (PROVISIONAL — see content/gmb/detail-fetcher.js).
-    // hoursRaw needs no type guard here: the CSV cell goes through escapeCsv.
-    if (!merged.hoursRaw && f.hoursRaw) merged.hoursRaw = f.hoursRaw;
-    if (merged.hoursDaysFound == null && f.hoursDaysFound != null
-        && typeof f.hoursDaysFound === 'number' && Number.isFinite(f.hoursDaysFound)) {
-        merged.hoursDaysFound = f.hoursDaysFound;
-    }
+    // BUG-4 inverse (2026-07-07): was `merged = {...existing}` + per-field merge
+    // + `saveBusiness(merged)` — a read OUTSIDE the tx then a full put, which
+    // regressed email/emailScraped/social/partitaIva if the email-scraper wrote
+    // them into the DB between this enrichment's `getBusiness` snapshot and its
+    // put. Now the per-field patch (`computeEnrichmentPatch`, lib/enrichmentMerge)
+    // is applied against the CURRENT record INSIDE updateBusinessMerge's single
+    // readwrite tx, so nothing written concurrently is regressed. `existing` is
+    // the fallback only if the row was deleted between the read and the merge.
+    await updateBusinessMerge(
+        dbKey,
+        (current) => computeEnrichmentPatch(current, f),
+        existing
+    );
+    // Telemetry depends only on the incoming fields, not on the merge result —
+    // keep it OUTSIDE the tx.
     if (f.hoursRaw) {
         enrichmentTelemetry.hoursFound++;
         enrichmentTelemetry.hoursDaysFoundSum += (f.hoursDaysFound || 0);
     } else {
         enrichmentTelemetry.hoursMissing++;
     }
-    await saveBusiness(merged);
-    logger.info(`[ENRICH] Merged deep-fields for ${merged.title || dbKey}`);
+    logger.info(`[ENRICH] Merged deep-fields for ${(existing && existing.title) || dbKey}`);
 }
 
 /**
@@ -1864,11 +1861,13 @@ async function addJobsInBatches(validTargets, invalidTargets) {
 
         for (const business of batch) {
             logger.info(`Skipping invalid/social URL for ${business.title}: ${business.website}`);
-            await updateBusiness({
-                ...business,
-                emailScraped: true,
-                scrapedFrom: 'skipped_invalid_url'
-            });
+            // BUG-4: atomic merge — mark the row scraped-skipped without a full
+            // put of the snapshot that would regress concurrent enrichment.
+            // BUG-7 (2026-07-07): the marker now ALSO stamps scrapedAt and uses
+            // the shared builder, so the export can surface an HONEST, distinct
+            // 'skipped_invalid_url' status (never the lying 'no_email') and the
+            // "Scraped At" column stops being permanently empty for these rows.
+            await updateBusinessMerge(business.googleMapsUrl, buildInvalidUrlSkipUpdate(), business);
         }
 
         // Yield between batches
@@ -2230,12 +2229,19 @@ function parseHTMLDirect(html, url) {
     // ITALIAN B2B FEATURE: Extract Partita IVA and Codice Fiscale
     // CRITICAL FIX: This was completely missing, causing 88% P.IVA loss!
     // ═══════════════════════════════════════════════════════════════════════════
-    const italianTaxCodes = { partitaIva: null, codiceFiscale: null };
+    const italianTaxCodes = { partitaIva: null, partitaIvaRaw: null, codiceFiscale: null };
 
     // Partita IVA — shared SSOT (lib/partitaIva.js): checksum-validated, handles
     // composite labels like "P.IVA/C.F. NNN" / "Cod.Fisc./Part.IVA/... NNN".
-    italianTaxCodes.partitaIva = extractPartitaIva(textContent);
+    // BUG-8 #8.1: also keep the rejected raw candidate (checksum false negative)
+    // so it reaches the CSV "Raw/Unvalidated" column instead of vanishing.
+    {
+        const piva = extractPartitaIvaWithRaw(textContent);
+        italianTaxCodes.partitaIva = piva.partitaIva;
+        italianTaxCodes.partitaIvaRaw = piva.partitaIvaRaw;
+    }
     if (italianTaxCodes.partitaIva) logger.info(`[FALLBACK] ✓ Found P.IVA: ${italianTaxCodes.partitaIva}`);
+    else if (italianTaxCodes.partitaIvaRaw) logger.info(`[FALLBACK] ⚠ P.IVA candidate failed checksum, kept as raw: ${italianTaxCodes.partitaIvaRaw}`);
 
     // Codice Fiscale pattern (16 alphanumeric chars with Italian structure)
     const cfPattern = /(?:C\.?\s*F\.?|Codice\s*Fiscale|Fiscal\s*Code)[:\s]*([A-Z]{6}\d{2}[A-EHLMPR-T]\d{2}[A-Z]\d{3}[A-Z])\b/gi;
@@ -2344,7 +2350,7 @@ async function getFailedBusinessesFromDB() {
             const wasScraped = business.emailScraped === true;
             const hasNoEmail = !business.email || business.email.trim() === '';
             const hasWebsite = business.website && business.website.trim() !== '';
-            const isNotSkipped = business.scrapedFrom !== 'skipped_invalid_url';
+            const isNotSkipped = business.scrapedFrom !== SKIPPED_INVALID_URL;
 
             return wasScraped && hasNoEmail && hasWebsite && isNotSkipped;
         });

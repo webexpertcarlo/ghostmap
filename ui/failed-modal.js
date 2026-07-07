@@ -526,13 +526,27 @@ async function exportFailedBusinesses() {
 }
 
 /**
- * Escape CSV field (handle quotes and newlines)
+ * Escape CSV field (handle quotes, newlines, and formula injection).
+ *
+ * BUG-5 #5.4 (2026-07-07): this failed-list export (Business Name / Website /
+ * Error Reason are attacker/site-controlled free text) previously only doubled
+ * quotes — a value starting with = + - @ was written verbatim inside the manual
+ * "…" wrapper and a spreadsheet would EXECUTE it as a formula on open (CSV
+ * injection). The main UI/API exports route through escapeCsv (formula-safe);
+ * this classic (non-module) modal script cannot import it, so mirror the guard:
+ * prefix an apostrophe to neutralize a leading formula trigger. The apostrophe is
+ * added INSIDE the cell (the caller wraps the return in "…"), so no column shift.
+ *
  * @param {string} field - Field value
  * @returns {string} - Escaped field
  */
 function escapeCsvField(field) {
     if (!field) return '';
-    return field.toString().replace(/"/g, '""').replace(/\n/g, ' ');
+    let s = field.toString();
+    // Formula-injection guard (OWASP): a leading = + - @ (or tab/CR) makes a
+    // spreadsheet treat the cell as a formula, even inside quotes.
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return s.replace(/"/g, '""').replace(/[\r\n]+/g, ' ');
 }
 
 /**

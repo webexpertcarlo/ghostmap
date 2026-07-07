@@ -214,10 +214,39 @@
         // showing `4,3` in italian UI — the storage uses dot).
         // PROVISIONAL anchor: schema may evolve; telemetry counts ratingFound
         // hits.
-        const ratingAnchor = text.match(/null,null,null,([1-5]\.\d),(\d{1,7})\b/);
-        if (ratingAnchor) {
-            fields.rating = parseFloat(ratingAnchor[1]);
-            fields.reviewCount = parseInt(ratingAnchor[2], 10);
+        // BUG-2 / DF-PARSE-1 (2026-07-07): do NOT commit to the FIRST
+        // `null,null,null,<rating>,<reviewCount>` occurrence in the whole body.
+        // A /preview/place response can embed neighbour-place aggregate tuples
+        // (related-places carousels) of the same shape earlier than the
+        // subject's, so a bare `text.match()` first-match reports the
+        // NEIGHBOUR's reviewCount (and the rating that rides on the same tuple)
+        // for the subject. Fix: gather ALL structural tuples, then prefer the
+        // one whose reviewCount is corroborated by a human-readable
+        // "<N> recensioni"/"<N> reviews" display string (the subject always
+        // renders its own aggregate count as text; a stray earlier tuple whose
+        // count is not displayed loses). Fall back to the first tuple when
+        // nothing corroborates — single-place bodies keep their prior behaviour.
+        // BUG-2 #2.3 (2026-07-07): the leading slot before the two nulls is a
+        // price-range token that is `null` for places with no price band but a
+        // QUOTED string ("€€€", "€10–20", …) for those that have one. The old
+        // 3-null anchor `null,null,null,<r>,<n>` therefore MISSED every place with
+        // a price range (e.g. San Giorgio → `"€€€",null,null,4.8,3910`), silently
+        // dropping rating+reviewCount. Widen the leading slot to accept null OR a
+        // quoted string. The two structural nulls + rating shape keep it anchored;
+        // `"[^"]*"` cannot span a comma so it still can't swallow adjacent tuples.
+        const ratingTuples = [...text.matchAll(/(?:null|"[^"]*"),null,null,([1-5]\.\d),(\d{1,7})\b/g)];
+        if (ratingTuples.length > 0) {
+            const displayedCounts = new Set();
+            // Strip grouping separators so "2.442 recensioni"/"2,442 reviews"
+            // both corroborate the raw pb integer 2442.
+            for (const cm of text.matchAll(/(\d[\d.,]*)\s*(?:recension[ei]|reviews?)\b/gi)) {
+                const n = parseInt(cm[1].replace(/[.,]/g, ''), 10);
+                if (Number.isFinite(n)) displayedCounts.add(n);
+            }
+            const chosen = ratingTuples.find(t => displayedCounts.has(parseInt(t[2], 10)))
+                || ratingTuples[0];
+            fields.rating = parseFloat(chosen[1]);
+            fields.reviewCount = parseInt(chosen[2], 10);
         }
         // TODO Wave 2 (long-term): consider subject-sub-tree extraction —
         // locate the place's pb sub-array first, then parse fields from it

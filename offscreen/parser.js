@@ -17,7 +17,7 @@ console.log('[OFFSCREEN-DIAG] Chrome runtime available:', typeof chrome !== 'und
  */
 
 import { CONFIG as AuthoritativeConfig } from '../lib/config.js';
-import { extractPartitaIva } from '../lib/partitaIva.js';
+import { extractPartitaIvaWithRaw } from '../lib/partitaIva.js';
 
 // ============================================================================
 // CONFIG REFERENCES (imported from lib/config.js - single source of truth)
@@ -569,6 +569,7 @@ const CODICE_FISCALE_PATTERN = /(?:C\.?\s*F\.?|Codice\s*Fiscale|Fiscal\s*Code)[:
 function extractItalianTaxCodes(doc) {
     const result = {
         partitaIva: null,
+        partitaIvaRaw: null,
         codiceFiscale: null
     };
 
@@ -581,8 +582,13 @@ function extractItalianTaxCodes(doc) {
 
     // Extract Partita IVA — shared SSOT (lib/partitaIva.js): checksum-validated,
     // handles composite labels like "P.IVA/C.F. NNN" / "Cod.Fisc./Part.IVA/... NNN".
-    result.partitaIva = extractPartitaIva(fullText);
+    // BUG-8 #8.1: also surface the rejected raw candidate so a checksum false
+    // negative (OCR/typo) is not lost — it flows to the CSV col 54.
+    const piva = extractPartitaIvaWithRaw(fullText);
+    result.partitaIva = piva.partitaIva;
+    result.partitaIvaRaw = piva.partitaIvaRaw;
     if (result.partitaIva) logger.info(`[FALLBACK] ✓ Found P.IVA: ${result.partitaIva}`);
+    else if (result.partitaIvaRaw) logger.info(`[FALLBACK] ⚠ P.IVA candidate failed checksum, kept as raw: ${result.partitaIvaRaw}`);
 
     // Extract Codice Fiscale
     CODICE_FISCALE_PATTERN.lastIndex = 0;

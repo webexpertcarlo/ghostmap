@@ -21,8 +21,13 @@
 import { CONFIG } from '../lib/config.js';
 import { logger } from '../lib/utils.js';
 import { sitemapDiscovery } from '../lib/SitemapDiscovery.js';
-import { updateBusiness } from '../lib/db.js';
-import { buildBusinessUpdates } from '../lib/businessUpdates.js'; // PIVA-01
+// BUG-4 (2026-07-07): updateBusinessMerge replaces the stale-snapshot full put.
+// Each save here read `business` a fresh snapshot at job start, then scraped for
+// seconds/minutes; a full put of `{...business, ...updates}` regressed any field
+// a concurrent detail-fetch enrichment wrote meanwhile. The merge re-reads the
+// CURRENT record inside one readwrite tx and applies only this job's `updates`.
+import { updateBusinessMerge } from '../lib/db.js';
+import { buildBusinessUpdates, mergeSocialLinks } from '../lib/businessUpdates.js'; // PIVA-01, BUG-3
 import { setupOffscreenDocument } from './offscreen-manager.js'; // HIGH FIX #5
 // B4-1: SessionPool no longer eager-imported — resolved lazily via _getPool()
 // from ServiceContainer to preserve restoreFromStorage semantics. The unused
@@ -1474,7 +1479,7 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
 
     const allEmails = new Set();
     let socialLinks = {};
-    let italianTaxCodes = { partitaIva: null, codiceFiscale: null };  // ITALIAN B2B FEATURE
+    let italianTaxCodes = { partitaIva: null, partitaIvaRaw: null, codiceFiscale: null };  // ITALIAN B2B FEATURE
     let successfulPage = null;
     let lastError = null;
     let blockingErrorOccurred = false; // Track if we hit any CAPTCHA/Cloudflare even if 404s follow
@@ -1527,16 +1532,21 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
                     italianTaxCodes.partitaIva = homepageResult.italianTaxCodes.partitaIva;
                     logger.info(`[ITALIAN B2B] ✓ Found P.IVA on homepage: ${italianTaxCodes.partitaIva}`);
                 }
+                // BUG-8 #8.1: carry the rejected raw candidate (checksum false
+                // negative) until a valid P.IVA is found on some page.
+                if (homepageResult.italianTaxCodes.partitaIvaRaw && !italianTaxCodes.partitaIva && !italianTaxCodes.partitaIvaRaw) {
+                    italianTaxCodes.partitaIvaRaw = homepageResult.italianTaxCodes.partitaIvaRaw;
+                }
                 if (homepageResult.italianTaxCodes.codiceFiscale) {
                     italianTaxCodes.codiceFiscale = homepageResult.italianTaxCodes.codiceFiscale;
                     logger.info(`[ITALIAN B2B] ✓ Found C.F. on homepage: ${italianTaxCodes.codiceFiscale}`);
                 }
             }
 
-            // Capture social links
-            if (homepageResult.socialLinks) {
-                socialLinks = homepageResult.socialLinks;
-            }
+            // Capture social links (BUG-3: null-safe merge — the parser emits
+            // null for every platform it did not find; a plain assignment
+            // seeded a null-filled object that poisoned every later merge)
+            socialLinks = mergeSocialLinks(socialLinks, homepageResult.socialLinks);
 
             // Check for emails on homepage - EARLY EXIT opportunity!
             if (homepageResult.emails?.length > 0) {
@@ -1569,12 +1579,20 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
                     const emailList = Array.from(allEmails);
                     // PIVA-01: helper omits partitaIva/codiceFiscale/social when
                     // empty so this early-exit save never clobbers prior enrichment.
-                    const updates = buildBusinessUpdates({
+                    // BUG-3: existingSocial lets it merge found socials per-key
+                    // with the snapshot's, since the full put replaces the object.
+                    // BUG-4 (#4.3) / BUG-3 (#3.1): compute the patch INSIDE the
+                    // merge tx against the CURRENT record (current?.social /
+                    // current?.partitaIva), not the stale job-start snapshot, so a
+                    // social platform (or valid P.IVA) written concurrently after
+                    // the snapshot is never dropped. The snapshot `business` is only
+                    // the fallback if the row was deleted mid-job.
+                    await updateBusinessMerge(business.googleMapsUrl, (current) => buildBusinessUpdates({
                         emailList, socialLinks, italianTaxCodes,
                         scrapedFrom: successfulPage || homepageUrl,
-                    });
-                    const updatedBusiness = { ...business, ...updates };
-                    await updateBusiness(updatedBusiness);
+                        existingSocial: current?.social,
+                        existingPartitaIva: current?.partitaIva,
+                    }), business);
                     logger.info(`✓✓✓ [SAVE] Saved ${allEmails.size} email(s) to database (speculative early-exit)`);
                     logger.info(`[NEXT] Ready for next business...\n`);
 
@@ -1608,6 +1626,17 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
         // If homepage already found emails AND stopOnFirstSuccess, we're done
         if (homepageEmailsFound && CONFIG.emailScraping.stopOnFirstSuccess) {
             logger.info(`[SPECULATIVE] Homepage emails found, stopOnFirstSuccess=true, skipping other pages`);
+            // BUG-8 #8.1 (P3): this early-exit previously returned WITHOUT saving —
+            // unlike the high-confidence early-exit and the terminal save — so with
+            // stopOnFirstSuccess:true a homepage-only scrape dropped the email AND
+            // partitaIvaRaw. Persist here via the same atomic merge before returning.
+            // BUG-4 #4.3 / BUG-3 #3.1: build against the CURRENT record inside the tx.
+            await updateBusinessMerge(business.googleMapsUrl, (current) => buildBusinessUpdates({
+                emailList: Array.from(allEmails), socialLinks, italianTaxCodes,
+                scrapedFrom: successfulPage || homepageUrl,
+                existingSocial: current?.social,
+                existingPartitaIva: current?.partitaIva,
+            }), business);
             await recordCircuitSuccess(domain);
             _getStats().recordBusinessProcessed(true);
             return {
@@ -1728,16 +1757,21 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
                         italianTaxCodes.partitaIva = result.italianTaxCodes.partitaIva;
                         logger.info(`[ITALIAN B2B] ✓ Found P.IVA: ${italianTaxCodes.partitaIva}`);
                     }
+                    // BUG-8 #8.1: carry the rejected raw candidate too.
+                    if (result.italianTaxCodes.partitaIvaRaw && !italianTaxCodes.partitaIva && !italianTaxCodes.partitaIvaRaw) {
+                        italianTaxCodes.partitaIvaRaw = result.italianTaxCodes.partitaIvaRaw;
+                    }
                     if (result.italianTaxCodes.codiceFiscale && !italianTaxCodes.codiceFiscale) {
                         italianTaxCodes.codiceFiscale = result.italianTaxCodes.codiceFiscale;
                         logger.info(`[ITALIAN B2B] ✓ Found C.F.: ${italianTaxCodes.codiceFiscale}`);
                     }
                 }
 
-                // Store social links early too
-                if (result.socialLinks && Object.keys(socialLinks).length === 0) {
-                    socialLinks = result.socialLinks;
-                }
+                // Store social links early too (BUG-3: accumulate found values
+                // across pages; the old `length === 0` guard was defeated by the
+                // parser's null-filled homepage object and dropped later finds,
+                // while a page without socials must never wipe earlier finds)
+                socialLinks = mergeSocialLinks(socialLinks, result.socialLinks);
 
                 // Check results
                 if (result.emails?.length > 0) {
@@ -1759,10 +1793,10 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
                         break;
                     }
 
-                    // Store social links
-                    if (result.socialLinks) {
-                        socialLinks = result.socialLinks;
-                    }
+                    // NOTE: social links are captured for EVERY page by the
+                    // mergeSocialLinks call above — the plain overwrite that
+                    // lived here let an email-bearing page with no socials
+                    // clobber socials found on earlier pages (BUG-3).
 
                     // NOTE: Italian tax codes are now extracted OUTSIDE this block
                     // to capture them even when no emails are found on a page
@@ -1885,8 +1919,9 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
                 scrapeError: 'cloudflare_protected'
             };
 
-            const updatedBusiness = { ...business, ...cloudflareUpdates };
-            await updateBusiness(updatedBusiness);
+            // BUG-4: atomic merge so a Cloudflare hit on a re-scrape marks the
+            // row scraped without regressing enrichment written during the job.
+            await updateBusinessMerge(business.googleMapsUrl, cloudflareUpdates, business);
 
             return {
                 emails: [],
@@ -1948,16 +1983,19 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
                 // Update success tracking
                 successfulPage = tabResult.successfulPage;
 
-                // Merge social links if found
-                if (tabResult.socialLinks && Object.keys(tabResult.socialLinks).length > 0) {
-                    socialLinks = { ...socialLinks, ...tabResult.socialLinks };
-                }
+                // Merge social links if found (BUG-3: the raw spread let null
+                // keys from the tab result overwrite values found via fetch)
+                socialLinks = mergeSocialLinks(socialLinks, tabResult.socialLinks);
 
                 // ITALIAN B2B FEATURE: Merge tax codes if found
                 if (tabResult.italianTaxCodes) {
                     if (tabResult.italianTaxCodes.partitaIva && !italianTaxCodes.partitaIva) {
                         italianTaxCodes.partitaIva = tabResult.italianTaxCodes.partitaIva;
                         logger.info(`[TAB FALLBACK] ✓ Found P.IVA: ${italianTaxCodes.partitaIva}`);
+                    }
+                    // BUG-8 #8.1: carry the rejected raw candidate too.
+                    if (tabResult.italianTaxCodes.partitaIvaRaw && !italianTaxCodes.partitaIva && !italianTaxCodes.partitaIvaRaw) {
+                        italianTaxCodes.partitaIvaRaw = tabResult.italianTaxCodes.partitaIvaRaw;
                     }
                     if (tabResult.italianTaxCodes.codiceFiscale && !italianTaxCodes.codiceFiscale) {
                         italianTaxCodes.codiceFiscale = tabResult.italianTaxCodes.codiceFiscale;
@@ -2002,13 +2040,21 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
     // this run, so a failed/empty re-scrape can't erase values from a previous
     // run (updateBusiness is a full put). It also records scrapeError when no
     // email was found this run.
-    const updates = buildBusinessUpdates({
+    // BUG-3: existingSocial lets it merge found socials per-key with the
+    // snapshot's, since updates.social replaces the whole object on the put.
+    // BUG-4: atomic merge onto the CURRENT DB record (not the job-start
+    // snapshot), so enrichment landed during this job is never regressed. The
+    // snapshot is the fallback only if the row was deleted mid-job.
+    // BUG-4 #4.3 / BUG-3 #3.1 / BUG-8 P2: build the patch INSIDE the tx from the
+    // CURRENT record — existingSocial/existingPartitaIva read `current`, so a
+    // concurrently-written social platform is not dropped and a run finding only
+    // an invalid raw P.IVA does not pollute col 54 when a valid one already exists.
+    await updateBusinessMerge(business.googleMapsUrl, (current) => buildBusinessUpdates({
         emailList, socialLinks, italianTaxCodes,
         scrapedFrom: successfulPage, lastError,
-    });
-
-    const updatedBusiness = { ...business, ...updates };
-    await updateBusiness(updatedBusiness);
+        existingSocial: current?.social,
+        existingPartitaIva: current?.partitaIva,
+    }), business);
 
     // Record business processing with email status (moved from start to end)
     const foundEmail = allEmails.size > 0;

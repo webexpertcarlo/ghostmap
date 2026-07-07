@@ -14,13 +14,16 @@ import { escapeCsv, logger } from '../lib/utils.js';
 import { normalizePhone, formatPhoneForCsv, formatPartitaIvaForCsv } from '../lib/phone-normalizer.js';
 import { CONFIG } from '../lib/config.js';
 import { haversineDistance } from '../lib/geo-grid.js';
-
-// BLOCK-M1 FIX: Use centralized blacklist from CONFIG
-const getEmailBlacklist = () => CONFIG.extraction.email.blacklist;
+// BUG-5 #5.1 (2026-07-07): email cleaning + honest Scrape Status derivation are
+// the SSOT in lib/exportSanitize.js, shared with lib/ExportAPI.js (which used to
+// hand-roll a divergent, weaker copy). Re-exported below so existing importers
+// (tests, generateCSV) keep resolving them from here.
+import { cleanEmailsForCsv, deriveScrapeStatus } from '../lib/exportSanitize.js';
+export { cleanEmailsForCsv, deriveScrapeStatus };
 
 /**
  * Export all business data as CSV format
- * @returns {Promise<{status: 'no_data'|'success'|'error', csv?: string, count?: number, error?: string}>} Export result with CSV data and metadata
+ * @returns {Promise<{status: 'no_data'|'success'|'error', csv?: string, count?: number, discarded?: number, error?: string}>} Export result with CSV data and metadata
  * @example
  * const result = await exportData();
  * if (result.status === 'success') {
@@ -36,7 +39,23 @@ export async function exportData() {
         }
 
         const csv = generateCSV(businesses);
-        return { status: 'success', csv, count: businesses.length };
+        // BUG-6 (2026-07-07): report the POST-filter count — the rows actually
+        // written to the CSV — not `businesses.length` (pre-filter). When
+        // DISCARD_OUT_OF_RADIUS drops rows, the old count over-reported and the
+        // user never learned rows were dropped. `selectExportRows` is the same
+        // partition generateCSV uses, so `count` matches the file exactly and
+        // `discarded` tells the UI how many were removed for being out of radius.
+        const { emitted, discarded } = selectExportRows(businesses);
+        // BUG-6 #6.4 (observability): a "short" export (rows dropped for being out
+        // of radius) was only signalled via a transient UI toast — invisible after
+        // the fact. Log the emitted/discarded partition so a later "why is my CSV
+        // shorter than the map count?" question is answerable from the SW logs.
+        if (discarded > 0) {
+            logger.info(`[EXPORT] ${emitted.length} rows written, ${discarded} discarded (out of radius) — total scanned ${businesses.length}`);
+        } else {
+            logger.info(`[EXPORT] ${emitted.length} rows written (no rows discarded)`);
+        }
+        return { status: 'success', csv, count: emitted.length, discarded };
 
     } catch (error) {
         logger.error('Export failed:', error);
@@ -53,54 +72,8 @@ export async function exportData() {
  * const csv = generateCSV([{title: 'Acme Corp', email: 'info@acme.com', ...}]);
  * // Returns: "Title,Category,...\nAcme Corp,..."
  */
-/**
- * Clean emails for CSV export - applies same filtering as Markdown export
- * Removes: Sentry/Wixpress tracking, UUID patterns, test emails, truncated emails
- * @param {string} rawEmails - Comma-separated email string from database
- * @returns {string} - Cleaned comma-separated emails
- */
-export function cleanEmailsForCsv(rawEmails) {
-    if (!rawEmails || typeof rawEmails !== 'string') return '';
-
-    // BLOCK-M1 FIX: Use centralized blacklist from CONFIG (single source of truth)
-    const blockedDomains = getEmailBlacklist();
-
-    const emails = rawEmails.split(/[,;]/).map(e => e.trim()).filter(e => e);
-    const cleanedEmails = [];
-
-    for (const email of emails) {
-        const cleanEmail = email.toLowerCase().trim();
-
-        // Skip empty
-        if (!cleanEmail || !cleanEmail.includes('@')) continue;
-
-        const [localPart, domain] = cleanEmail.split('@');
-
-        // Skip if no valid structure
-        if (!localPart || !domain) continue;
-
-        // EXP-02 FIX (2026-06-09): suffix-match, NOT substring. The extraction
-        // filters (offscreen/parser.js:428, background/index.js) already use this
-        // exact form. `domain.includes(d)` wrongly dropped legitimate addresses
-        // whose domain merely CONTAINS a blacklist entry — e.g. negoziowix.com
-        // vs `wix.co`, ecotest.com vs `test.co`, subdomain.com vs `domain.co`.
-        // Those emails were in the DB but silently vanished from CSV/MD exports.
-        if (blockedDomains.some(d => domain === d || domain.endsWith('.' + d))) continue;
-
-        // Skip UUID/hash-like local parts (20+ hex chars)
-        if (localPart.length >= 20 && /^[a-f0-9]+$/.test(localPart)) continue;
-
-        // Skip truncated emails (local part too short, likely extraction error)
-        if (localPart.length < 2) continue;
-
-        // Skip generic test patterns
-        if (cleanEmail === 'user@domain.com' || cleanEmail === 'abc@xxx.com') continue;
-
-        cleanedEmails.push(email.trim());
-    }
-
-    return cleanedEmails.join(', ');
-}
+// cleanEmailsForCsv + deriveScrapeStatus now live in lib/exportSanitize.js (SSOT,
+// shared with lib/ExportAPI.js — see the import/re-export at the top of this file).
 
 /**
  * R-DETAIL (2026-05-05): serialize the `reviewThemes` array to a stable
@@ -271,6 +244,26 @@ function radiusColumns(b) {
     return [km.toFixed(1), km > b.searchRadiusKm ? 'Yes' : 'No'];
 }
 
+/**
+ * BUG-6 (2026-07-07): single source of truth for which rows the CSV export
+ * actually writes vs. how many were hard-dropped for being out-of-radius.
+ * Both `generateCSV` (row emission) and `exportData` (the user-facing count)
+ * partition through this helper, so the reported count can never drift from
+ * the rows really in the file.
+ *
+ * CF4/P7 guard: rows without finite coords / stamped center+radius are never
+ * judged out-of-radius (isOutOfRadius → false), so coord-less and
+ * non-area-search rows are always emitted and never counted as discarded.
+ *
+ * @param {Array<object>} businesses
+ * @returns {{ emitted: Array<object>, discarded: number }}
+ */
+export function selectExportRows(businesses) {
+    const list = Array.isArray(businesses) ? businesses : [];
+    const emitted = DISCARD_OUT_OF_RADIUS ? list.filter(b => !isOutOfRadius(b)) : list;
+    return { emitted, discarded: list.length - emitted.length };
+}
+
 export function generateCSV(businesses) {
     const headers = [
         // ── CORE (existing — DO NOT REORDER, downstream consumers depend on column index) ──
@@ -337,23 +330,39 @@ export function generateCSV(businesses) {
         'Website Domain',
         // ── AREA-SEARCH RADIUS (distance from the search center, stamped at scrape time) ──
         'Distance From Center (km)',
-        'Out Of Radius'
+        'Out Of Radius',
+        // ── BUG-8 (2026-07-07): unvalidated raw P.IVA ──
+        // At ingest (lib/sanitize.js:280-289) a P.IVA that fails the Italian
+        // checksum is moved to `partitaIvaRaw` and `partitaIva` set to null. The
+        // validated column above only ever holds a checksum-VALID value, so a
+        // false negative (OCR/typo on a real P.IVA, or a foreign-format VAT)
+        // used to EMPTY the "Partita IVA" cell with no trace — silent data loss.
+        // This dedicated LAST column surfaces the grezzo so nothing is lost,
+        // while keeping validated vs. unvalidated strictly distinguishable.
+        // Appended at the END on purpose: every existing column index stays
+        // stable for downstream consumers (see the CORE "DO NOT REORDER" note).
+        'Partita IVA (Raw/Unvalidated)'
     ];
 
     // RCA Root Cause B: drop provably out-of-radius rows (flag-gated, default ON).
     // CF4: rows without coords / center / radius are never out-of-radius → kept.
-    const emitted = DISCARD_OUT_OF_RADIUS
-        ? businesses.filter(b => !isOutOfRadius(b))
-        : businesses;
+    // BUG-6: partition via the shared helper so the count exportData reports is
+    // sourced from the exact same filter that decides which rows are written.
+    const { emitted } = selectExportRows(businesses);
 
-    const rows = emitted.map(b => [
+    const rows = emitted.map(b => {
+        // BUG-5 (2026-07-07): clean the email ONCE, then derive the Scrape Status
+        // from that same post-filter value — so the status cell can never claim
+        // "success" while the Email cell (also post-filter) is empty.
+        const cleanedEmail = cleanEmailsForCsv(b.email);
+        return [
         // ── CORE ──
         escapeCsv(b.title),
         escapeCsv(b.category),
         formatPhoneForCsv(b.phone),
         escapeCsv(b.website),
-        escapeCsv(cleanEmailsForCsv(b.email)),
-        b.emailScraped ? (b.email ? 'success' : 'no_email') : 'pending',
+        escapeCsv(cleanedEmail),
+        deriveScrapeStatus(b, cleanedEmail),
         formatPartitaIvaForCsv(b.partitaIva || ''),
         formatPartitaIvaForCsv(b.codiceFiscale || ''),
         // DEBT-CSV-1 ROLLBACK (2026-06-11, sera): the hoursRaw/reviewCount
@@ -366,8 +375,22 @@ export function generateCSV(businesses) {
         // export; re-enable here only after the parser is validated
         // (FINDINGS: DEBT-CSV-1 rollback + DF-PARSE-1).
         escapeCsv(b.openingHours || ''),
-        b.rating || '',
-        b.reviews || '',
+        // F8-b (2026-07-07): escape Rating/Reviews at the CSV MOUTH too. F8
+        // closed the SOURCE (numeric type-guard in enrichmentMerge), so today
+        // these are always numbers — and escapeCsv is a no-op on a valid number
+        // (String(4.7)==="4.7", no dangerous prefix, no comma), so the current
+        // export stays byte-identical. But a legacy/forged record carrying a
+        // STRING ("4,4" Italian decimal, or "=cmd") would otherwise splice a
+        // comma / inject a formula through the ONLY two cells that skipped the
+        // escape. Defense-in-depth: escape here so a bad value can never shift
+        // columns or execute in a spreadsheet.
+        // F8.2 (rimanenze.md): this escape — NOT the write-path type-guard — is the
+        // load-bearing defense for legacy/forged records (computeEnrichmentPatch is
+        // not on their path). Do NOT remove it "because they're always numbers":
+        // the guarantee is enforced by tests/run-rating-reviews-escape-f8b-node.mjs
+        // (column-shift "4,4" + =HYPERLINK injection). Keep that runner as the gate.
+        escapeCsv(b.rating || ''),
+        escapeCsv(b.reviews || ''),
         escapeCsv(b.address),
         escapeCsv(b.social?.facebook),
         escapeCsv(b.social?.instagram),
@@ -419,8 +442,18 @@ export function generateCSV(businesses) {
         escapeCsv(serializeServiceOptions(b.serviceOptions)),
         escapeCsv(b.websiteDomain || ''),
         // ── AREA-SEARCH RADIUS ──
-        ...radiusColumns(b)
-    ]);
+        ...radiusColumns(b),
+        // ── BUG-8: unvalidated raw P.IVA ──
+        // `partitaIvaRaw` is untrusted free text (it FAILED the checksum and may
+        // carry OCR noise / stray labels / Excel-formula prefixes), so it goes
+        // through escapeCsv — the exact same formula-injection-safe path as every
+        // other free-text column — NOT formatPartitaIvaForCsv (whose hand-rolled
+        // ="…" wrapper does not double internal quotes and would column-shift on a
+        // raw containing "). It is only ever populated when the checksum failed,
+        // so a validated row leaves this cell empty.
+        escapeCsv(b.partitaIvaRaw || '')
+        ];
+    });
 
     return [
         headers.join(','),
@@ -447,9 +480,6 @@ export async function exportEmailsMarkdown() {
 
         // Extract all unique emails
         const uniqueEmails = new Set();
-
-        // BLOCK-M1 FIX: Use centralized blacklist from CONFIG (single source of truth)
-        const blockedDomains = getEmailBlacklist();
 
         // ═══════════════════════════════════════════════════════════════════════════════
         // MARKDOWN-CSV ALIGNMENT FIX (18 Dec 2025)
@@ -541,6 +571,7 @@ export async function exportUrls() {
 export default {
     exportData,
     generateCSV,
+    deriveScrapeStatus,
     exportEmailsMarkdown,
     exportUrls
 };
