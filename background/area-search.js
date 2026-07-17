@@ -620,6 +620,27 @@ async function _untrackWindow(windowId) {
 }
 
 /**
+ * AS-3 (ATP 2026-07-17): forget a window from BOTH trackers — the in-memory
+ * `TURBO_STATE.openTabs` Set AND the session-storage marker ledger — after a
+ * CONFIRMED close. Pre-fix cleanupTabs untracked the ledger even on a real
+ * close-FAILURE (so `_closeOrphanWindows` could no longer sweep the orphan)
+ * and never pruned openTabs at all (the two trackers drifted). Call ONLY once
+ * the close is confirmed; on failure leave BOTH intact so the next
+ * lifecycle-boundary sweep retries and wipes the ledger.
+ * @param {number} windowId
+ * @param {number} [tabId]
+ * @returns {Promise<void>}
+ * @private
+ */
+async function _forgetWindow(windowId, tabId) {
+    if (typeof tabId === 'number' && TURBO_STATE.openTabs.has(tabId)) {
+        TURBO_STATE.openTabs.delete(tabId);
+        _schedulePersist();  // B3-1: Set mutation doesn't trigger the Proxy setter
+    }
+    await _untrackWindow(windowId);
+}
+
+/**
  * Read the tracked windows ledger. Filters out entries whose marker doesn't
  * match the current session — guards against ledger from a previous Chrome
  * session (defensive; chrome.storage.session normally clears on browser restart
@@ -1019,6 +1040,26 @@ async function startTurboV3(config) {
 // =====================================================
 
 /**
+ * AS-2 (ATP 2026-07-17): when the WINDOW_CREATE_TIMEOUT race is lost, the
+ * underlying chrome.windows.create may still resolve later, opening a popup
+ * that was never tracked (openTabs/ledger fill only on the race-win branch)
+ * and therefore survives _closeOrphanWindows. Bind the late window to its
+ * own removal. All failures are swallowed — this is best-effort cleanup.
+ * Exported for tests/run-atp-medium-as1-as2-br2-br3-node.mjs.
+ */
+function _bindOrphanWindowCleanup(windowPromise) {
+    Promise.resolve(windowPromise)
+        .then((w) => {
+            if (w?.id) {
+                console.warn(`[TAB] Closing late-created orphan window ${w.id} (create resolved after timeout)`);
+                return chrome.windows.remove(w.id);
+            }
+            return undefined;
+        })
+        .catch(() => { /* late reject or remove-failure: nothing to clean */ });
+}
+
+/**
  * Create tabs with timeout, error recovery, and failure tracking
  * SECURITY: Prevents resource exhaustion from stuck tab creations
  * @param {Array} batch - Array of search objects
@@ -1081,6 +1122,8 @@ async function createTabsWithRecovery(batch) {
         // Reset circuit wait counter on successful proceed
         circuitWaitAttempts = 0;
 
+        let windowPromise = null;
+
         try {
             // HUMANIZATION: Add delay between tab opens (except first)
             if (i > 0) {
@@ -1110,7 +1153,7 @@ async function createTabsWithRecovery(batch) {
             // "active" tab of its window. Chrome does NOT throttle active tabs,
             // so all tabs scroll at full speed in parallel!
             // ═══════════════════════════════════════════════════════════════════
-            const windowPromise = chrome.windows.create({
+            windowPromise = chrome.windows.create({
                 url: jitteredUrl,
                 type: 'popup',           // Popup window - each is the active tab, no throttling!
                 width: 600,              // Compact size (was causing full-screen windows)
@@ -1150,6 +1193,13 @@ async function createTabsWithRecovery(batch) {
             const errorMsg = error.message || 'unknown';
             console.warn(`[TAB] Failed to create tab for "${search.keyword}": ${errorMsg}`);
             failedSearches.push({ search, error: errorMsg });
+
+            // AS-2 (ATP 2026-07-17): the raced chrome.windows.create can STILL
+            // resolve after the timeout rejection — bind the late window to its
+            // own cleanup so it can't survive as an untracked orphan popup.
+            if (errorMsg === 'WINDOW_CREATE_TIMEOUT' && windowPromise) {
+                _bindOrphanWindowCleanup(windowPromise);
+            }
 
             // Report failure to CAPTCHA detector
             CaptchaDetector.reportFailure();
@@ -1231,17 +1281,28 @@ async function cleanupTabs(tabs, timeoutMs = SECURITY_LIMITS.BATCH_CLEANUP_TIMEO
         if (windowId) {
             // Close the entire popup window
             return chrome.windows.remove(windowId)
-                .then(() => _untrackWindow(windowId))
+                // AS-3 (ATP 2026-07-17): forget BOTH trackers only on a CONFIRMED close.
+                .then(() => _forgetWindow(windowId, tab?.id))
                 .catch((/** @type {any} */ err) => {
+                    // AS-3: a REAL close failure may leave the window OPEN — do NOT
+                    // untrack it (pre-fix did, orphaning it from _closeOrphanWindows).
+                    // Leave both trackers intact; the next lifecycle-boundary sweep
+                    // retries the close and wipes the ledger.
                     console.warn(`[SECURITY] Failed to close window ${windowId}:`, err?.message || err);
-                    // Best-effort untrack even on close failure (window may already be gone)
-                    return _untrackWindow(windowId).catch(() => {});
                 });
         } else {
             // Fallback: close tab if no window (backwards compatibility)
-            return chrome.tabs.remove(tab.id).catch(err => {
-                console.warn(`[SECURITY] Failed to close tab ${tab.id}:`, err.message);
-            });
+            return chrome.tabs.remove(tab.id)
+                .then(() => {
+                    // AS-3: prune openTabs on a confirmed tab close too.
+                    if (TURBO_STATE.openTabs.has(tab.id)) {
+                        TURBO_STATE.openTabs.delete(tab.id);
+                        _schedulePersist();
+                    }
+                })
+                .catch(err => {
+                    console.warn(`[SECURITY] Failed to close tab ${tab.id}:`, err.message);
+                });
         }
     });
 
@@ -3177,8 +3238,12 @@ async function finishTurbo() {
         // never aborts completion.
         let recoveredFromQueue = 0;
         try {
+            // BUG-4 (2026-07-07): fill-holes merge, not a full put of the frozen
+            // snapshot — recovering a DLQ record must never regress fields that
+            // later runs enriched onto the same URL. Single-attempt by design
+            // (no retry loop), preserving the old {retry:false} drain budget.
             const drainRes = await drainDeadLetter(
-                (b) => dbInstance.saveBusiness(b, { retry: false }),
+                (b) => dbInstance.saveBusinessFillHoles(b),
                 { maxRecords: 100, maxMs: 3000 }
             );
             recoveredFromQueue = drainRes.drained;
@@ -3605,6 +3670,13 @@ export { _wakeObserversInTabs, _waitForDetailFetcherIdle, _collectDetailFetcherS
 // AS-01 (2026-06-10): exported for tests/run-area-search-orphan-cleanup-as01-node.mjs.
 // Internal lifecycle-boundary sweep — NOT public API.
 export { _closeOrphanWindows };
+// AS-3 (ATP 2026-07-17): exported for tests/run-atp-low-lc4-as3-node.mjs.
+// cleanupTabs SECURITY API (closes marker-tracked windows/tabs).
+// _forgetWindow helper (updates BOTH trackers on confirmed close).
+export { cleanupTabs, _forgetWindow };
+// AS-2 (ATP 2026-07-17): exported for tests/run-atp-medium-as1-as2-br2-br3-node.mjs.
+// Binds late-created windows to their own cleanup on timeout race loss.
+export { _bindOrphanWindowCleanup };
 // fix-area-search-wrong-center (01-01): pure, rank-preserving Nominatim
 // settlement selection. Exported for tests/run-area-search-geocode-node.mjs.
 export { selectGeocodeResult };

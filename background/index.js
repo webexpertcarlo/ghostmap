@@ -85,7 +85,7 @@ import {
 // BUG-016 FIX: Import reset functions for factory reset
 // CRAWLEE FEATURE 1.1: Import getStatistics for retry histogram
 // CRAWLEE PHASE 2.2: Import initializeSessionPool for persistence
-import { resetStatistics, getStatistics, setSessionPoolForStats } from '../lib/Statistics.js';
+import { resetStatistics, getStatistics, setSessionPoolForStats, configureStatistics } from '../lib/Statistics.js';
 import { resetSessionPool, initializeSessionPool, shutdownSessionPool } from '../lib/SessionPool.js';
 
 // v9.12 Wave 1: detail-fetch enrichment telemetry. Counts hit/miss for
@@ -373,7 +373,7 @@ async function initialize() {
         // B4-1 fix: Statistics also wired here so email-scraper-v2.js _getStats()
         // can resolve via container instead of eager-init at module load.
         // setSessionPoolForStats wires Statistics → SessionPool integration.
-        const statistics = getStatistics({ logIntervalSecs: 120 });
+        const statistics = configureStatistics({ logIntervalSecs: 120 });
         setSessionPoolForStats(sessionPool);
         container.register('statistics', statistics);
         logger.info('Statistics initialized + SessionPool wired + DI registered');
@@ -1167,10 +1167,15 @@ async function handleMessage(message, sender) {
 
             // ========== AREA SEARCH (TURBO MODE) ==========
 
-            case 'start_area_search':
-                // P1 FIX: Start keep-alive to prevent SW termination during long sessions
-                startKeepAlive('area-search');
-                return await AreaSearch.start(payload);
+            case 'start_area_search': {
+                // AS-1 (ATP 2026-07-17): arm the keepalive only on a CONFIRMED start —
+                // the three startTurboV3 early-returns (already_running, validation_failed,
+                // location-not-found) never reach finishTurbo→stopKeepAlive, so arming
+                // first leaked a sticky 30s alarm on every failed start.
+                const res = await AreaSearch.start(payload);
+                if (res?.status === 'started') startKeepAlive('area-search');
+                return res;
+            }
 
             case 'pause_area_search':
                 return AreaSearch.pause();
@@ -1529,7 +1534,12 @@ async function handleBusinessFound(business) {
             try {
                 await _doEnrichmentMerge(business, queuedPayload.fields, dbKey);
             } catch (mergeErr) {
-                logger.warn(`[ENRICH] post-save drain failed for ${dbKey}: ${mergeErr?.message}`);
+                // BR-4 (ATP 2026-07-17): takeIfReady already dropped the entry
+                // and cleared its retry timers — a bare warn here would LOSE the
+                // enrichment. Re-enqueue so the timer retries still fire (the
+                // queue merges fields on same-key enqueue → no data loss).
+                logger.warn(`[ENRICH] post-save drain failed for ${dbKey}, re-queuing: ${mergeErr?.message}`);
+                enrichmentRetryQueue.enqueue(dbKey, queuedPayload, _enrichmentRetryHandler);
             }
         }
 
@@ -1600,12 +1610,7 @@ async function handleBusinessEnrichment(payload) {
             // business_found to the SW (~2-3% on v9.9.0), enqueue and let
             // either (a) the post-save hook in handleBusinessFound or (b) a
             // 500ms/1s/2s timer drain it. Hard expiry at 30s.
-            enrichmentRetryQueue.enqueue(dbKey, payload, async (key, p) => {
-                const e = await getBusiness(key);
-                if (!e) return false;
-                await _doEnrichmentMerge(e, p.fields, key);
-                return true;
-            });
+            enrichmentRetryQueue.enqueue(dbKey, payload, _enrichmentRetryHandler);
             logger.info(`[ENRICH] No existing business for ${dbKey} — queued for retry`);
             return { status: 'queued', id: dbKey };
         }
@@ -1616,6 +1621,18 @@ async function handleBusinessEnrichment(payload) {
         return { status: 'error', error: error.message };
     }
 }
+
+/**
+ * BR-4 (ATP 2026-07-17): shared onRetry handler for the enrichment retry
+ * queue. A single reference so BOTH the initial enqueue and the post-save
+ * drain's re-enqueue-on-failure use the same lookup+merge logic.
+ */
+const _enrichmentRetryHandler = async (key, p) => {
+    const e = await getBusiness(key);
+    if (!e) return false;
+    await _doEnrichmentMerge(e, p.fields, key);
+    return true;
+};
 
 /**
  * Strict "fill the holes" merge of detail-fetch fields into an existing
@@ -1638,12 +1655,14 @@ async function _doEnrichmentMerge(existing, fields, dbKey) {
     // them into the DB between this enrichment's `getBusiness` snapshot and its
     // put. Now the per-field patch (`computeEnrichmentPatch`, lib/enrichmentMerge)
     // is applied against the CURRENT record INSIDE updateBusinessMerge's single
-    // readwrite tx, so nothing written concurrently is regressed. `existing` is
-    // the fallback only if the row was deleted between the read and the merge.
+    // readwrite tx, so nothing written concurrently is regressed.
+    // W2 (ATP 2026-07-17): the fallback is `null`, NOT `existing` — enrichment is
+    // pure hole-fill and must never resurrect a row deleted between the read and the
+    // merge tx (db.js:1131 no-ops on a null base).
     await updateBusinessMerge(
         dbKey,
         (current) => computeEnrichmentPatch(current, f),
-        existing
+        null
     );
     // Telemetry depends only on the incoming fields, not on the merge result —
     // keep it OUTSIDE the tx.

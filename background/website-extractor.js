@@ -10,7 +10,10 @@
  */
 
 import { logger } from '../lib/utils.js';
-import { updateBusiness, getBusinessesWithoutWebsite } from '../lib/db.js';
+// BUG-4 (2026-07-07): updateBusinessMerge replaces the stale-snapshot full put —
+// this worker read `business` before the extraction, so a full put of
+// `{...business, website}` would regress any field enriched meanwhile.
+import { updateBusinessMerge, getBusinessesWithoutWebsite } from '../lib/db.js';
 import { createSessionState } from '../lib/swState.js';
 
 // =====================================================
@@ -269,8 +272,9 @@ export async function extractMissingWebsites() {
                     const website = await extractWebsiteFromGMB(business.googleMapsUrl);
 
                     if (website) {
-                        // Update database - pass complete business object
-                        await updateBusiness({ ...business, website });
+                        // BUG-4: atomic merge — write ONLY the discovered website
+                        // onto the current record, preserving concurrent enrichment.
+                        await updateBusinessMerge(business.googleMapsUrl, { website }, business);
                         stats.found++;
                         logger.info(`[WEBSITE EXTRACTOR] ✓ Found website: ${website}`);
                     } else {

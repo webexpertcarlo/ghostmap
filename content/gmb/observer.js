@@ -19,6 +19,7 @@ import { SelectorEngine } from '../../lib/SelectorEngine.js';
 import { normalizePhone } from '../../lib/phone-normalizer.js';
 // Step 03-03: Sanitize DOM-extracted data before messaging
 import { sanitizeBusinessData } from '../../lib/sanitize.js';
+import { isPlausibleRating, isPlausibleReviewCount, isPlausibleLatitude, isPlausibleLongitude } from '../../lib/rangeGuards.js';
 
 /**
  * Simple LRU Cache to prevent memory leaks
@@ -1129,8 +1130,8 @@ export class DOMObserver {
 
             // Choose state-derived rating only when DOM didn't extract one.
             // ratingDecimal is a number (e.g. 4.8); DOM rating may be string ("4,8") → parsed.
-            const stateRating = (stateBiz && typeof stateBiz.ratingDecimal === 'number') ? stateBiz.ratingDecimal : null;
-            const stateReviews = (stateBiz && typeof stateBiz.reviewsCount === 'number') ? stateBiz.reviewsCount : null;
+            const stateRating = (stateBiz && isPlausibleRating(stateBiz.ratingDecimal)) ? stateBiz.ratingDecimal : null;
+            const stateReviews = (stateBiz && isPlausibleReviewCount(stateBiz.reviewsCount)) ? stateBiz.reviewsCount : null;
             const stateAddress = stateBiz?.addressFormatted || null;
             const stateWebsite = stateBiz?.website || null;
             const stateCategory = stateBiz?.primaryCategory || null;
@@ -1162,8 +1163,9 @@ export class DOMObserver {
             if (stateBiz) {
                 if (stateBiz.placeId) business.placeId = business.placeId || stateBiz.placeId;
                 if (stateBiz.knowledgeGraphId) business.knowledgeGraphId = stateBiz.knowledgeGraphId;
-                if (typeof stateBiz.latitude === 'number') business.latitude = stateBiz.latitude;
-                if (typeof stateBiz.longitude === 'number') business.longitude = stateBiz.longitude;
+                // BR-3 (ATP 2026-07-17): state-map is a page-forgeable bridge — clamp with the same shared range guards as the enrichment seam (a forged latitude:9999 would silently drop the row via isOutOfRadius).
+                if (isPlausibleLatitude(stateBiz.latitude)) business.latitude = stateBiz.latitude;
+                if (isPlausibleLongitude(stateBiz.longitude)) business.longitude = stateBiz.longitude;
                 if (stateBiz.city) business.city = stateBiz.city;
                 if (stateBiz.addressFormatted) business.addressFormatted = stateBiz.addressFormatted;
                 if (stateBiz.postcode) business.postcode = stateBiz.postcode;

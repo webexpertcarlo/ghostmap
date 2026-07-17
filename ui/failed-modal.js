@@ -1,7 +1,7 @@
 /**
  * Failed Businesses Modal - FIXED VERSION
  * Shows detailed list of businesses that failed email scraping with error reasons
- * 
+ *
  * FIXES APPLIED:
  * - Fixed categorization logic to avoid double-counting
  * - Added proper error handling for missing message handler
@@ -9,6 +9,8 @@
  * - Fixed "no website" categorization to only include actual failures
  * - Added retry mechanism for failed requests
  */
+
+import { cleanEmailsForCsv } from '../lib/exportSanitize.js';
 
 // Add Failed Businesses Modal HTML
 const failedModalHTML = `
@@ -141,7 +143,11 @@ function closeFailedModal() {
 function categorizeFailure(business) {
     const hasWebsite = business.website && business.website.trim() !== '';
     const wasScraped = business.emailScraped === true;
-    const hasEmail = business.email && business.email.trim() !== '';
+    // E6 (ATP 2026-07-17): count "usable email" via the SSOT blacklist filter,
+    // NOT raw business.email truthiness. A business whose only emails are
+    // blacklisted/garbage has business.email truthy but cleanEmailsForCsv → '',
+    // so the raw check under-counted failures vs the authoritative CSV.
+    const hasEmail = cleanEmailsForCsv(business.email).trim() !== '';
     const hasError = business.scrapeError && business.scrapeError.trim() !== '';
 
     // If business has an email, it's not a failure
@@ -489,9 +495,12 @@ async function exportFailedBusinesses() {
                 'noWebsite': 'No Website'
             }[category] || 'Unknown';
 
+            // E6 (ATP 2026-07-17): key the "no email found" label off the SSOT
+            // cleaned email too (not raw b.email) — a business whose only emails
+            // are blacklisted is now correctly listed AND labelled.
             const errorReason = b.scrapeError ||
                 (!b.website ? 'No website listed' :
-                    (b.emailScraped && !b.email ? 'Scraped but no email found' : 'Unknown'));
+                    (b.emailScraped && !cleanEmailsForCsv(b.email) ? 'Scraped but no email found' : 'Unknown'));
 
             csv += `"${escapeCsvField(b.title || '')}",`;
             csv += `"${escapeCsvField(b.website || '')}",`;

@@ -71,7 +71,16 @@ setCircuitHooks({ isCircuitOpen, recordCircuitFailure });
 
 // Eager init for singletons WITHOUT storage-restore semantics:
 const navigationHooks = getNavigationHooks();
-const systemMonitor = getSystemMonitor();
+
+// LC-1 (ATP 2026-07-17): SystemMonitor is NO LONGER fetched eagerly here.
+// The old eager `const systemMonitor = getSystemMonitor()` ran during the
+// import phase — BEFORE index.js initialize() calls initializeSystemMonitor()
+// with the authoritative {onCritical,...} — and won the first-config-wins race,
+// so the anti-OOM callbacks were silently dropped (mirror of the Forensic #9
+// AutoScaler fix documented just below). Resolve lazily.
+function _getSystemMonitor() {
+    return getSystemMonitor();
+}
 
 // Forensic #9 (2026-06-11): AutoScaler is NO LONGER fetched eagerly here.
 // The old `const autoScaler = getAutoScaler()` at module load ran during the
@@ -288,7 +297,7 @@ export async function isCircuitOpen(domain) {
 
         const now = Date.now();
         const elapsed = now - (state.openedAt || 0);
-        const cooldownMs = getCooldownForError(state.lastError);
+        const cooldownMs = getCooldownForError(state.lastError) * (state.cooldownMultiplier || 1); // LC-2 (ATP 2026-07-17): honour the escalated cooldown (mirrors lib/CircuitBreaker.js)
 
         // Cooldown expired - transition to half-open state
         if (elapsed >= cooldownMs) {
@@ -328,7 +337,7 @@ export async function isCircuitOpen(domain) {
  * State persisted via chrome.storage.session.
  * @param {string} domain - Domain that succeeded
  */
-async function recordCircuitSuccess(domain) {
+export async function recordCircuitSuccess(domain) {
     // BG-2 FIX: serialize entire read-modify-write under _circuitMutex.
     return _circuitMutex.runExclusive(async () => {
         const all = await _circuitBreakerState.get();
@@ -363,7 +372,7 @@ async function recordCircuitSuccess(domain) {
  * @param {string} domain - Domain that failed
  * @param {string} [errorType] - Type of error for adaptive cooldown
  */
-async function recordCircuitFailure(domain, errorType = 'DEFAULT') {
+export async function recordCircuitFailure(domain, errorType = 'DEFAULT') {
     // BG-2 FIX: serialize entire read-modify-write under _circuitMutex.
     return _circuitMutex.runExclusive(async () => {
         let all = await _circuitBreakerState.get();
@@ -389,7 +398,8 @@ async function recordCircuitFailure(domain, errorType = 'DEFAULT') {
             state.halfOpen = false;
             state.failures = CIRCUIT_OPEN_THRESHOLD;
             state.openedAt = Date.now();
-            logger.warn(`[CIRCUIT] 🔴 Domain ${domain} failed half-open test - circuit re-opened`);
+            state.cooldownMultiplier = Math.min((state.cooldownMultiplier || 1) * 2, 16); // LC-2: exponential backoff, mirrors lib/CircuitBreaker.js:436
+            logger.warn(`[CIRCUIT] 🔴 Domain ${domain} failed half-open test - circuit re-opened with ${state.cooldownMultiplier}x cooldown`);
             all[domain] = state;
             await _circuitBreakerState.set(all);
             return;

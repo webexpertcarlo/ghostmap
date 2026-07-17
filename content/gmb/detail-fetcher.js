@@ -224,8 +224,9 @@
         // one whose reviewCount is corroborated by a human-readable
         // "<N> recensioni"/"<N> reviews" display string (the subject always
         // renders its own aggregate count as text; a stray earlier tuple whose
-        // count is not displayed loses). Fall back to the first tuple when
-        // nothing corroborates — single-place bodies keep their prior behaviour.
+        // count is not displayed loses). With ≥2 tuples and NO corroboration,
+        // emit nothing (X2) — the first is likely a neighbour aggregate.
+        // Single-tuple bodies keep the prior fallback for backward compatibility.
         // BUG-2 #2.3 (2026-07-07): the leading slot before the two nulls is a
         // price-range token that is `null` for places with no price band but a
         // QUOTED string ("€€€", "€10–20", …) for those that have one. The old
@@ -243,10 +244,23 @@
                 const n = parseInt(cm[1].replace(/[.,]/g, ''), 10);
                 if (Number.isFinite(n)) displayedCounts.add(n);
             }
-            const chosen = ratingTuples.find(t => displayedCounts.has(parseInt(t[2], 10)))
-                || ratingTuples[0];
-            fields.rating = parseFloat(chosen[1]);
-            fields.reviewCount = parseInt(chosen[2], 10);
+            // X2 (ATP 2026-07-17): a WRONG rating in the subject's CSV cell is
+            // worse than a missing one, so emission requires an UNAMBIGUOUS pick:
+            //  - exactly ONE distinct corroborated aggregate → use it (the same
+            //    tuple serialized twice is still one distinct aggregate);
+            //  - ≥2 DISTINCT corroborated tuples (carousel cards each rendering
+            //    their own "N recensioni") → first-corroborated-wins would return
+            //    a NEIGHBOUR with false confidence → emit nothing;
+            //  - no corroboration: single-tuple bodies keep the prior fallback,
+            //    multi-tuple bodies emit nothing (tuple[0] is often a neighbour).
+            const corroboratedAll = ratingTuples.filter(t => displayedCounts.has(parseInt(t[2], 10)));
+            const distinct = new Set(corroboratedAll.map(t => `${t[1]},${t[2]}`));
+            const chosen = (distinct.size === 1 ? corroboratedAll[0] : null)
+                || (corroboratedAll.length === 0 && ratingTuples.length === 1 ? ratingTuples[0] : null);
+            if (chosen) {
+                fields.rating = parseFloat(chosen[1]);
+                fields.reviewCount = parseInt(chosen[2], 10);
+            }
         }
         // TODO Wave 2 (long-term): consider subject-sub-tree extraction —
         // locate the place's pb sub-array first, then parse fields from it

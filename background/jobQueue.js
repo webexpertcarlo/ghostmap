@@ -49,6 +49,11 @@ export class JobQueue {
         this.activeJobs = new Map();
         this.failedJobs = [];
         this.mutex = new Mutex();
+        // F2 FIX: dedicated mutex serializing the read-modify-write on
+        // chrome.storage.session[_activeJobsPersistKey]. Separate from
+        // this.mutex (which _processQueue holds for the whole batch) so
+        // persist/unpersist writes stay prompt → B6-1 eviction-safety preserved.
+        this._activeJobsMutex = new Mutex();
         // BUG-023 FIX: Validate test mode is only used in test environments
         this.testMode = options.testMode ?? false;
         // BLOCK-1 FIX: Use globalThis instead of window (service workers don't have window)
@@ -95,6 +100,12 @@ export class JobQueue {
         // clock — at worst we briefly process one extra job that the
         // pre-eviction breaker would have blocked).
         this._restoreCircuitOnce();
+
+        // F1 FIX: distingues "coda ferma perché il circuito è scattato" da uno
+        // stop/pausa iniziato dall'utente. Solo il primo caso deve auto-riavviarsi
+        // allo scadere del cooldown; azzerato appena l'utente riprende il controllo
+        // (stop/pause/start). Evita di sovraccaricare isPaused con due significati.
+        this._stoppedByCircuit = false;
 
         // Status
         this.isProcessing = false;
@@ -231,6 +242,7 @@ export class JobQueue {
         // resume() and add() could pass the guard before either set the flag.
         this.isProcessing = true;
         this.isPaused = false;
+        this._stoppedByCircuit = false; // F1: fresh start clears circuit-halt intent
         this._cancellationRequested = false; // M2-RACE1: Reset cancellation on start
         logger.info('Job queue started');
 
@@ -242,6 +254,7 @@ export class JobQueue {
      */
     pause() {
         this.isPaused = true;
+        this._stoppedByCircuit = false; // F1: user pause overrides any circuit auto-restart
         logger.info('Job queue paused');
     }
 
@@ -278,6 +291,7 @@ export class JobQueue {
         this.isPaused = true;
         this.isProcessing = false;
         this._jobsAddedDuringProcessing = false; // M4-BUG1: Reset dirty flag on stop
+        this._stoppedByCircuit = false; // F1: a plain stop() is NOT a circuit halt
         this._cancellationRequested = true; // M2-RACE1: Signal addJobsInBatches to stop
 
         // BGW-H2 FIX: Clear all pending timers
@@ -529,14 +543,23 @@ export class JobQueue {
                             // registered AFTER stop() finishes, so it
                             // survives.
                             await this.stop();
+                            // F1 FIX: mark this halt as circuit-initiated so the
+                            // cooldown timer can auto-restart it (stop() cleared it).
+                            this._stoppedByCircuit = true;
                             // Schedule a restart check after timeout
                             const circuitTimerId = setTimeout(() => {
                                 this._untrackTimer(circuitTimerId);
-                                // After cooldown, circuit should be closable
-                                if (this.queue.length > 0 && !this.isPaused) {
+                                // F1 FIX: gate on _stoppedByCircuit, NOT !isPaused.
+                                // stop() left isPaused=true, so the old guard was
+                                // always false and the queue froze forever. If the
+                                // user has since taken manual control, stop()/pause()
+                                // cleared _stoppedByCircuit and we correctly skip the
+                                // auto-restart. start() itself clears isPaused.
+                                if (this.queue.length > 0 && this._stoppedByCircuit) {
                                     logger.info('[QUEUE] Circuit breaker cooldown complete, restarting...');
                                     this.circuitOpen = false;
                                     this.consecutiveFailures = 0;
+                                    this._stoppedByCircuit = false;
                                     this._schedulePersistCircuit();  // BG-7: persist closed
                                     this.start();
                                 }
@@ -562,6 +585,12 @@ export class JobQueue {
                             const waitTime = this.burstCooldownMs - timeSinceBurst;
                             logger.info(`[QUEUE] Burst limit reached, cooling down for ${Math.round(waitTime / 1000)}s`);
                             await sleep(waitTime);
+                            // F4 (ATP 2026-07-17): a stop()/pause() during the (up to
+                            // 15s) burst cooldown must not be overrun. Without this
+                            // the loop falls straight through to shift()+dispatch and
+                            // runs one extra job after Stop — the top-of-loop guard
+                            // only re-checks at the NEXT iteration, too late.
+                            if (this.isPaused) break;
                         }
                         // Reset burst counter
                         this.requestsInBurst = 0;
@@ -1188,33 +1217,37 @@ export class JobQueue {
      */
     async _persistActiveJob(job) {
         if (!job?.persistable || !job?.type) return;  // closure jobs: skip
-        try {
-            const r = await chrome.storage.session.get(this._activeJobsPersistKey);
-            const cur = r[this._activeJobsPersistKey];
-            const entries = (cur && cur.version === this._activeJobsSchemaVersion && cur.entries)
-                ? cur.entries
-                : {};
-            entries[job.id] = {
-                id: job.id,
-                type: job.type,
-                params: job.params,
-                retries: job.retries || 0,
-                maxRetries: job.maxRetries || CONFIG.errors.maxRetries,
-                addedAt: job.addedAt,
-                domain: job.domain,
-                startedAt: Date.now(),
-                persistable: true
-            };
-            await chrome.storage.session.set({
-                [this._activeJobsPersistKey]: {
-                    version: this._activeJobsSchemaVersion,
-                    entries
-                }
-            });
-        } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            logger.debug('[JobQueue] _persistActiveJob failed:', msg);
-        }
+        // F2 FIX: atomic RMW — concurrent fire-and-forget calls otherwise
+        // read the same snapshot and the later set() clobbers the earlier.
+        return this._activeJobsMutex.runExclusive(async () => {
+            try {
+                const r = await chrome.storage.session.get(this._activeJobsPersistKey);
+                const cur = r[this._activeJobsPersistKey];
+                const entries = (cur && cur.version === this._activeJobsSchemaVersion && cur.entries)
+                    ? cur.entries
+                    : {};
+                entries[job.id] = {
+                    id: job.id,
+                    type: job.type,
+                    params: job.params,
+                    retries: job.retries || 0,
+                    maxRetries: job.maxRetries || CONFIG.errors.maxRetries,
+                    addedAt: job.addedAt,
+                    domain: job.domain,
+                    startedAt: Date.now(),
+                    persistable: true
+                };
+                await chrome.storage.session.set({
+                    [this._activeJobsPersistKey]: {
+                        version: this._activeJobsSchemaVersion,
+                        entries
+                    }
+                });
+            } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e);
+                logger.debug('[JobQueue] _persistActiveJob failed:', msg);
+            }
+        });
     }
 
     /**
@@ -1226,19 +1259,22 @@ export class JobQueue {
      */
     async _unpersistActiveJob(jobId) {
         if (!jobId) return;
-        try {
-            const r = await chrome.storage.session.get(this._activeJobsPersistKey);
-            const cur = r[this._activeJobsPersistKey];
-            if (!cur || cur.version !== this._activeJobsSchemaVersion || !cur.entries) return;
-            if (!(jobId in cur.entries)) return;
-            delete cur.entries[jobId];
-            await chrome.storage.session.set({
-                [this._activeJobsPersistKey]: cur
-            });
-        } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            logger.debug('[JobQueue] _unpersistActiveJob failed:', msg);
-        }
+        // F2 FIX: atomic RMW on the same key as _persistActiveJob.
+        return this._activeJobsMutex.runExclusive(async () => {
+            try {
+                const r = await chrome.storage.session.get(this._activeJobsPersistKey);
+                const cur = r[this._activeJobsPersistKey];
+                if (!cur || cur.version !== this._activeJobsSchemaVersion || !cur.entries) return;
+                if (!(jobId in cur.entries)) return;
+                delete cur.entries[jobId];
+                await chrome.storage.session.set({
+                    [this._activeJobsPersistKey]: cur
+                });
+            } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e);
+                logger.debug('[JobQueue] _unpersistActiveJob failed:', msg);
+            }
+        });
     }
 
     /**

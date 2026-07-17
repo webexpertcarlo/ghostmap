@@ -147,6 +147,51 @@
     const accumulatedBusinesses = {};
     const ACCUMULATOR_CAP = 5000; // safety bound per session
 
+    // BR-2 (ATP 2026-07-17): plausibility canaries against PARTIAL JSPB index
+    // drift. A shift that keeps the CID slot intact ships type-correct-but-
+    // wrong values into ~27 CSV columns with zero signal. Three anchors are
+    // cheap to validate; an implausible anchor is counted AND nulled (never
+    // shipped). postcode is IT-gated so foreign postcodes are never dropped.
+    const CANARY_POSTCODE_IT_RE = /^\d{5}$/;
+    const CANARY_COUNTRY_RE = /^[A-Z]{2}$/;
+    const _driftStats = { canaryFailures: {}, recordsChecked: 0 };
+    let _lastCanaryWarnAt = 0;
+    function _recordCanaryFailure(field) {
+        _driftStats.canaryFailures[field] = (_driftStats.canaryFailures[field] || 0) + 1;
+        const now = Date.now();
+        if (now - _lastCanaryWarnAt > 30000) {
+            _lastCanaryWarnAt = now;
+            try {
+                console.warn(
+                    `[GhostMap state-watcher] JSPB drift canary FAILED on "${field}" — ` +
+                    `partial index shift suspected (CID gate still passes). Implausible ` +
+                    `value dropped. Counters: ${JSON.stringify(_driftStats.canaryFailures)}`
+                );
+            } catch { /* ignore */ }
+        }
+    }
+    /** Validate the 3 canary anchors on an extracted record; null out the implausible ones. */
+    function applyDriftCanaries(biz) {
+        _driftStats.recordsChecked++;
+        if (biz.countryCode != null && !CANARY_COUNTRY_RE.test(biz.countryCode)) {
+            _recordCanaryFailure('countryCode');
+            biz.countryCode = null;
+        }
+        if (biz.ratingDecimal != null
+            && !(typeof biz.ratingDecimal === 'number' && isFinite(biz.ratingDecimal)
+                && biz.ratingDecimal >= 0 && biz.ratingDecimal <= 5)) {
+            _recordCanaryFailure('ratingDecimal');
+            biz.ratingDecimal = null;
+        }
+        // IT-gated: only judge the postcode when the record credibly claims Italy.
+        if (biz.postcode != null && biz.countryCode === 'IT'
+            && !CANARY_POSTCODE_IT_RE.test(biz.postcode)) {
+            _recordCanaryFailure('postcode');
+            biz.postcode = null;
+        }
+        return biz;
+    }
+
     function findJspbPayload(state) {
         // CO-9 FIX (2026-05-10): bound the worst-case work. Pre-fix the
         // depth-20 cap was on the recursive call only; the for-loop at each
@@ -375,7 +420,7 @@
         const reviewsCount = typeof inner[4]?.[8] === 'number' ? inner[4][8] : parseReviewsCount(reviewsText);
         const ratingDecimal = typeof inner[4]?.[7] === 'number' ? inner[4][7] : null;
 
-        return {
+        return applyDriftCanaries({
             // identity
             cid: cid.toLowerCase(),
             title: typeof inner[11] === 'string' ? inner[11] : null,
@@ -427,7 +472,7 @@
             ownerPhotoUrl: typeof inner[157] === 'string' ? inner[157] : null,
             // amenities
             serviceOptions: extractServiceOptions(inner)
-        };
+        });
     }
 
     /**
@@ -516,7 +561,11 @@
                             businesses,                           // full field catalog
                             size: sizeB,
                             phoneSize: sizeP,
-                            ts: Date.now()
+                            ts: Date.now(),
+                            drift: {
+                                canaryFailures: { ..._driftStats.canaryFailures },
+                                recordsChecked: _driftStats.recordsChecked
+                            }
                         }
                     }, location.origin);
                     if (DEBUG) {

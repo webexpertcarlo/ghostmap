@@ -109,9 +109,16 @@ const RETRY_ELIGIBLE_ERRORS = [
 // module-load call that won the "first-config-wins" singleton race — creating
 // the pool with DEFAULTS before index.js initialize() could set the
 // authoritative {maxErrorScore:5, maxAgeSecs:1800}. Removed entirely: kills the
-// race and drops dead code in one move. (getStatistics() is genuinely used at
-// line ~773 and carries no comparable tuning config, so it stays.)
-const statistics = getStatistics();
+// race and drops dead code in one move.
+
+// LC-4 (ATP 2026-07-17): getStatistics() is NO LONGER fetched eagerly here.
+// The eager module-load `const statistics = getStatistics()` (no options) won
+// the first-config-wins race, pinning the singleton to the 60s default before
+// index.js configureStatistics({logIntervalSecs:120}) could apply. Resolve
+// lazily; authoritative config comes from index.js via configureStatistics().
+function _getStats() {
+    return getStatistics();
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STATE MANAGEMENT — B5-4 P0 FIX (eviction-safe)
@@ -799,7 +806,7 @@ export async function scrapeWithTab(business, options = {}) {
 
         // Record statistics
         if (result.emails.length > 0) {
-            statistics.recordEmail(true);
+            _getStats().recordEmail(true);
         }
 
         return {
