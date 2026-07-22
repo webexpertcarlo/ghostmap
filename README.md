@@ -13,7 +13,7 @@
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-7d54f0.svg?style=flat-square)](#-contributing)
 ![GitHub stars](https://img.shields.io/github/stars/uppifyagency/ghostmap?style=flat-square&color=34A853)
 
-[**What it does**](#-what-it-does) · [**Features**](#-features) · [**Install**](#-installation) · [**How it works**](#-how-it-works) · [**vs Apify / Outscraper**](#-ghost-map-pro-vs-apify-vs-outscraper-vs-the-official-api) · [**FAQ**](#-faq)
+[**What it does**](#-what-it-does) · [**Features**](#-features) · [**Install**](#-installation) · [**How it works**](#-how-it-works) · [**vs Apify / Outscraper**](#-ghost-map-pro-vs-apify-vs-outscraper-vs-the-official-api) · [**FAQ**](#-faq) · [**Changelog**](CHANGELOG.md)
 
 </div>
 
@@ -55,6 +55,7 @@ The CSV is Excel-safe (phone numbers and VAT codes keep their leading `+`/`0`) a
 - 🪝 **Export your way** — download CSV or push leads to a **webhook** (with SSRF-hardened URL validation) for your own automation.
 - 🔒 **Private by design** — no servers, no telemetry, no account. Leads live in your browser's local storage until *you* export them.
 - 🧩 **Manifest V3, auditable** — plain JavaScript, no build step, easy to fork and read.
+- 🧪 **Battle-tested & actively hardened** — a 136-check test suite plus repeated adversarial review passes cover concurrency, MV3 lifecycle, data integrity and export safety. See the [changelog](CHANGELOG.md).
 
 ---
 
