@@ -4,7 +4,7 @@ Notable changes to Ghost Map Pro. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org/) (in sync with `manifest.json`).
 
-## [9.12.13] — Reliability & hardening (2026-06 → 2026-07)
+## [9.13.0] — Reliability & hardening (2026-06 → 2026-07)
 
 A large reliability wave landed under this version, focused on robustness rather than
 new user-facing features. Full test suite green (136/136).
