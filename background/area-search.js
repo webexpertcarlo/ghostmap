@@ -16,7 +16,6 @@
  * 🔒 DoS attack prevention
  * 
  * ANTI-CAPTCHA FEATURES:
- * 🤖 Session management with fingerprint rotation
  * 🤖 Automatic blocking detection and recovery
  * 🤖 Comprehensive statistics tracking
  */
@@ -26,7 +25,6 @@
 // =====================================================
 
 import { CONFIG } from '../lib/config.js';
-import { getSessionPool } from '../lib/SessionPool.js';
 import { getStatistics } from '../lib/Statistics.js';
 import { Mutex } from '../lib/mutex.js';
 // OBS-4 (2026-05-17): import DB for finalize-time stats reconciliation. The
@@ -51,16 +49,18 @@ import {
 // The inline version in executeScript is used because executeScript runs in page context
 // and cannot use imported modules. See BUG-004 note in extractEnhanced function.
 
-// Session pool for anti-detection (lazy accessor).
-// Forensic #11 (2026-06-11): this used to call getSessionPool({...config...})
-// at module load with maxErrorScore:3 — racing index.js initialize()'s
-// authoritative {maxErrorScore:5, maxAgeSecs:1800} under "first-config-wins".
-// Now we resolve lazily with NO options (pure accessor); index.js owns the
-// authoritative config and SessionPool.initialize() applies it to the live
-// instance regardless of creation order.
-function _getSessionPool() {
-    return getSessionPool();
-}
+// S9 (2026-08-18): SessionPool usage REMOVED from area-search — it was theater.
+// The per-cell getSession() acquired a synthetic session (headers/fingerprint)
+// that was stored in createdTabs and never consumed: no markGood/markBad, and
+// nothing applied it to the real Chrome popup windows (the browser supplies
+// UA/cookies/TLS itself). Worse: the pool is the SAME singleton email-scraper-v2
+// consumes for REAL fetch headers, so each theatrical getSession() drained
+// usageCount budget (retire at 30) of sessions carrying genuine fingerprints.
+// Cabling instead of removing would be more theater (no consumption point
+// exists for window-driven traffic). SessionPool remains fully wired in
+// email-scraper-v2 (getSessionHeaders + markGood/markBad).
+// Test: tests/run-s9-area-search-session-theater-node.mjs.
+// (Forensic #11's eager-config concern is moot here: no pool access at all.)
 
 // Initialize statistics tracking
 const statistics = getStatistics({
@@ -68,7 +68,7 @@ const statistics = getStatistics({
     persistIntervalMs: 60000   // Persist to storage every minute
 });
 
-console.log('[LEVELUP] SessionPool and Statistics initialized');
+console.log('[LEVELUP] Statistics initialized');
 
 // =============================================================================
 // ANTI-DETECTION HUMANIZATION MODULE
@@ -205,6 +205,41 @@ const CaptchaDetector = {
         return getRemainingCooldown(CAPTCHA_DOMAIN);
     }
 };
+
+/**
+ * S10 (2026-08-18): audit a 0-result cell's tab for a CAPTCHA/interstitial
+ * page BEFORE the batch cleanup closes it.
+ *
+ * A cell that extracts 0 businesses is ambiguous: legitimately empty area
+ * (rural zone) vs a Google "unusual traffic"/CAPTCHA page that renders zero
+ * result cards. Pre-S10, checkForCaptcha was DEAD CODE — the breaker only
+ * fed on window-CREATION failures, so an in-window CAPTCHA let the run grind
+ * empty cells with no breaker and no user signal.
+ *
+ * Runs ONLY on 0-result cells (zero cost on the happy path) and looks for
+ * SPECIFIC markers via checkForCaptcha (unusual traffic / not a robot /
+ * recaptcha iframe / #captcha / title) — a plain empty cell returns false
+ * and does NOT feed the breaker. A dead/closed tab is absorbed by
+ * checkForCaptcha's internal try/catch (returns false): flow preserved.
+ *
+ * On a confirmed hit, feeds the EXISTING breaker path — same
+ * CaptchaDetector.reportFailure() the window-creation failures use
+ * (threshold 3 → unified CircuitBreaker opens + area_search_captcha_detected
+ * broadcast; the next batch pauses in createTabsWithRecovery.canProceed).
+ * No new breaker semantics invented.
+ *
+ * @param {number} tabId - tab of the cell that yielded 0 businesses
+ * @returns {Promise<boolean>} true if a CAPTCHA/interstitial was confirmed
+ *
+ * Spec & regression test: tests/run-s10-area-search-captcha-cell-audit-node.mjs
+ */
+async function _auditZeroResultCell(tabId) {
+    const isCaptcha = await CaptchaDetector.checkForCaptcha(tabId);
+    if (!isCaptcha) return false;
+    console.warn(`[CAPTCHA] Tab ${tabId}: 0-result cell is a CAPTCHA/interstitial page — feeding breaker, cell marked not-searched`);
+    CaptchaDetector.reportFailure();
+    return true;
+}
 
 console.log('[HUMANIZATION] HumanBehavior and CaptchaDetector initialized (C8: unified circuit breaker)');
 
@@ -1130,8 +1165,9 @@ async function createTabsWithRecovery(batch) {
                 await HumanBehavior.humanDelay(100, 800);
             }
 
-            // Get session with fingerprint for anti-detection
-            const session = await _getSessionPool().getSession();
+            // S9 (2026-08-18): former `getSession()` call removed — the session
+            // was never consumed (windows carry the real browser fingerprint)
+            // and it drained the shared pool used for real by email-scraper-v2.
 
             // ANTI-DETECTION: Add coordinate jitter to URL
             let jitteredUrl = search.url;
@@ -1175,7 +1211,6 @@ async function createTabsWithRecovery(batch) {
             createdTabs.push({
                 tab,
                 search,
-                session,
                 windowId: createdWindow.id  // Track window for cleanup
             });
 
@@ -1899,9 +1934,26 @@ async function runTurboV3() {
             // a Proxy, so avoid a per-business get.
             const _runCfg = TURBO_STATE.config || {};
 
+            // S10: count cells whose 0-result page showed CAPTCHA markers.
+            let captchaCells = 0;
+
             for (const { tab, search } of createdTabs) {
                 try {
                     const businesses = await extractEnhanced(tab.id);
+
+                    // S10: 0 extracted is ambiguous (legit empty cell vs
+                    // CAPTCHA interstitial). Audit the still-open tab BEFORE
+                    // cleanupTabs closes it; a confirmed hit feeds the
+                    // existing breaker and the cell counts as NOT searched
+                    // instead of legitimately empty. Cells with results skip
+                    // the check entirely.
+                    if (businesses.length === 0) {
+                        const captchaHit = await _auditZeroResultCell(tab.id);
+                        if (captchaHit) {
+                            captchaCells++;
+                            continue;
+                        }
+                    }
 
                     for (const biz of businesses) {
                         // Add search context
@@ -1933,6 +1985,27 @@ async function runTurboV3() {
                 } catch (e) {
                     console.error(`[EXTRACTION ERROR] Tab ${tab.id}:`, e.message);
                 }
+            }
+
+            // S10: captcha-confirmed cells are NOT searched — reuse the
+            // Forensic #18 under-sampling counter (surfaced by finishTurbo;
+            // B3-1 replacement-style write so the Proxy persists) and warn
+            // the UI once per batch on the existing area_search_warning
+            // channel ({message} payload shape handled by both sidepanel.js
+            // and area-search-modal.js). Fire-and-forget per convention.
+            if (captchaCells > 0) {
+                TURBO_STATE.stats = {
+                    ...TURBO_STATE.stats,
+                    cellsNotSearched: (TURBO_STATE.stats.cellsNotSearched || 0) + captchaCells
+                };
+                chrome.runtime.sendMessage({
+                    action: 'area_search_warning',
+                    payload: {
+                        type: 'captcha_cells',
+                        cells: captchaCells,
+                        message: `CAPTCHA page detected in ${captchaCells} cell(s) — cells skipped, not counted as empty`
+                    }
+                }).catch(() => { });
             }
 
             // Save remaining businesses
@@ -3680,4 +3753,7 @@ export { _bindOrphanWindowCleanup };
 // fix-area-search-wrong-center (01-01): pure, rank-preserving Nominatim
 // settlement selection. Exported for tests/run-area-search-geocode-node.mjs.
 export { selectGeocodeResult };
+// S10 (2026-08-18): exported for tests/run-s10-area-search-captcha-cell-audit-node.mjs.
+// Internal 0-result-cell CAPTCHA audit — NOT public API.
+export { _auditZeroResultCell };
 export default { start: startTurboV3, pause: pauseTurbo, resume: resumeTurbo, stop: stopTurbo, status: getTurboStatus, setSaveHandler, setOnRunFinished };

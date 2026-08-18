@@ -101,6 +101,38 @@ const PENDING_BUSINESSES_KEY = 'gmp:pending_businesses';
 const PENDING_BUSINESSES_CAP = 100;
 let _flushingPendingBusinesses = false;
 
+// ─── S4 FIX (2026-08-18): cross-tab lock for every queue RMW ──────────────
+// The single-flight flag above is PER-TAB. With 2 Maps tabs on the same
+// origin, tab A's flush (read → send → rewrite) raced tab B's append
+// (read-modify-write): whichever wrote last erased the other's entries.
+// Fix: every read-modify-write of the key — append AND the flush's final
+// write — runs under an exclusive, origin-scoped Web Lock (navigator.locks:
+// cross-tab, FIFO grant order, auto-released if the holding tab dies).
+// The lock is held ONLY around the synchronous localStorage sections, never
+// across the sendMessage awaits — otherwise a concurrent tab's append would
+// block for minutes during a drain (and be lost if that tab closed while
+// waiting). Data format is unchanged (compatible with queues already
+// persisted by older versions).
+// Fallback: if navigator.locks is unavailable (very old Chrome / exotic
+// context), run the section directly — exactly the pre-S4 per-tab behavior.
+const PENDING_BUSINESSES_LOCK = 'gmp:pending_businesses:lock';
+async function _withQueueLock(fn) {
+    const locks = globalThis.navigator?.locks;
+    if (!locks || typeof locks.request !== 'function') return fn();
+    let started = false;
+    try {
+        return await locks.request(PENDING_BUSINESSES_LOCK, () => {
+            started = true;
+            return fn();
+        });
+    } catch (err) {
+        if (started) throw err; // fn itself threw — propagate
+        // Lock machinery failed before running fn (e.g. document not fully
+        // active) — degrade to the per-tab behavior rather than lose data.
+        return fn();
+    }
+}
+
 function _readPendingBusinesses() {
     try {
         const raw = localStorage.getItem(PENDING_BUSINESSES_KEY);
@@ -130,12 +162,46 @@ function _writePendingBusinesses(arr) {
 }
 
 function _appendPendingBusiness(business) {
-    const pending = _readPendingBusinesses();
-    pending.push({ business, ts: Date.now() });
-    _writePendingBusinesses(pending);
-    if (pending.length >= PENDING_BUSINESSES_CAP) {
-        logger.warn(`[B2-7] Pending businesses queue at cap (${PENDING_BUSINESSES_CAP}); oldest entries will be dropped`);
-    }
+    // S4 FIX: the read-modify-write runs under the cross-tab lock so a
+    // concurrent flush rewrite (or append) in another tab can't erase it.
+    // Returns a promise that never rejects (fn is fully try/catch'd inside
+    // read/write; lock failures degrade to a direct run) — callers may
+    // stay fire-and-forget.
+    return _withQueueLock(() => {
+        const pending = _readPendingBusinesses();
+        pending.push({ business, ts: Date.now() });
+        _writePendingBusinesses(pending);
+        if (pending.length >= PENDING_BUSINESSES_CAP) {
+            logger.warn(`[B2-7] Pending businesses queue at cap (${PENDING_BUSINESSES_CAP}); oldest entries will be dropped`);
+        }
+    });
+}
+
+// ─── S3 FIX (2026-08-18): response-status taxonomy ────────────────────────
+// Pre-fix, ANY non-exception sendMessage response counted as delivery, so
+// application-level error responses from the SW ({status:'init_pending'},
+// {status:'error'}) dequeued the business without it ever being saved —
+// silent, permanent data loss.
+// Taxonomy (from background/index.js handleMessage/handleBusinessFound):
+//   DELIVERED (remove from queue):
+//     'saved'     — row inserted (~L1556)
+//     'duplicate' — row already exists / fill-holes merged (~L1499-1502)
+//     'rejected'  — M2-SEC1 sender-validation refusal (~L809). Deterministic:
+//                   the same sender gets the same refusal forever, so a retry
+//                   can never succeed — dropping is correct (retrying would
+//                   only burn cap-100 slots and evict recoverable entries).
+//   TRANSIENT (keep in queue for retry):
+//     'init_pending' — SW init gate not open after 10s (~L821); NOT saved.
+//     'error'        — handler threw (~L1364-1372), e.g. IndexedDB failure
+//                      during SW shutdown; plausibly transient.
+//     undefined / unknown future statuses — safe default is retry:
+//                      business_found is an idempotent fill-holes upsert, so
+//                      re-sending an already-saved business returns
+//                      'duplicate' (self-healing dequeue), while a wrong
+//                      removal is irreversible loss.
+const DELIVERED_STATUSES = new Set(['saved', 'duplicate', 'rejected']);
+function _isDeliveredResponse(response) {
+    return DELIVERED_STATUSES.has(response?.status);
 }
 
 async function flushPendingBusinesses() {
@@ -148,19 +214,59 @@ async function flushPendingBusinesses() {
 
         logger.info(`[B2-7] Draining pending businesses queue: ${pending.length} entries`);
         const remaining = [];
+        let processedCount = 0;
         for (const item of pending) {
+            processedCount++;
             try {
-                await chrome.runtime.sendMessage({
+                const response = await chrome.runtime.sendMessage({
                     action: 'business_found',
                     payload: item.business
                 });
-                // success — don't re-queue
+                // S3 FIX: only a DELIVERED response dequeues. Transient
+                // application-level responses (init_pending/error/unknown)
+                // are re-queued for the next flush attempt.
+                if (!_isDeliveredResponse(response)) {
+                    remaining.push(item);
+                    if (response?.status === 'init_pending') {
+                        // S3 FIX: the SW init gate blocks each send ~10s
+                        // (_waitForInit) before answering init_pending —
+                        // draining a full queue would hold the single-flight
+                        // lock for minutes. Re-queue the rest untouched and
+                        // let a later trigger retry.
+                        logger.warn('[S3] SW init_pending — deferring remaining queue entries');
+                        remaining.push(...pending.slice(processedCount));
+                        break;
+                    }
+                }
+                // delivered (saved/duplicate) or permanently refused
+                // (rejected) — don't re-queue
             } catch (err) {
                 // SW still dead — re-queue for next flush attempt.
                 remaining.push(item);
             }
         }
-        _writePendingBusinesses(remaining);
+        // S4 FIX: the final write is a lock-protected MERGE, not a blind
+        // rewrite. Between our snapshot read above and this point, another
+        // tab (or this tab's own append path) may have appended entries to
+        // the shared key; a blind rewrite with `remaining` would erase them.
+        // Under the lock: re-read the key, keep every entry that was NOT in
+        // our flushed snapshot (identity by JSON — entries are {business,ts}
+        // and ts is ms-precision, so collisions are negligible; a false
+        // positive only drops an exact byte-identical duplicate, which is
+        // benign because business_found is an idempotent upsert), then write
+        // remaining (old, FIFO order preserved) followed by those new
+        // appends (newer, so last). _writePendingBusinesses re-applies the
+        // cap-100 (drops oldest first). Entries stayed persisted throughout
+        // the send phase — a tab killed mid-drain loses nothing (re-sends
+        // self-heal as 'duplicate'). Web Locks auto-release if the holding
+        // tab dies inside the critical section.
+        await _withQueueLock(() => {
+            const current = _readPendingBusinesses();
+            const flushedSnapshot = new Set(pending.map((e) => JSON.stringify(e)));
+            const appendedMeanwhile = current.filter((e) => !flushedSnapshot.has(JSON.stringify(e)));
+            remaining.push(...appendedMeanwhile);
+            _writePendingBusinesses(remaining);
+        });
         if (remaining.length === 0) {
             logger.info('[B2-7] Pending queue drained successfully');
         } else {
@@ -185,6 +291,19 @@ function handleNewBusiness(business) {
                 action: 'business_found',
                 payload: business
             });
+
+            // S3 FIX: a resolved sendMessage is NOT proof of delivery — the
+            // SW answers {status:'init_pending'} (init gate, NOT saved) and
+            // {status:'error'} (handler threw, NOT saved) as normal
+            // resolutions. Queue those for durable retry instead of logging
+            // "saved" and dropping the business forever. No in-band backoff
+            // here: init_pending already waited ~10s inside the SW's
+            // _waitForInit, so an immediate retry adds nothing.
+            if (!_isDeliveredResponse(response)) {
+                logger.warn(`[S3] Non-delivered response (status=${response?.status}); queuing for retry`);
+                _appendPendingBusiness(business);
+                return;
+            }
             logger.debug('Business saved:', response);
 
             // B2-7 FIX: opportunistic flush on success — if SW just came

@@ -11,6 +11,12 @@
  */
 
 import { cleanEmailsForCsv } from '../lib/exportSanitize.js';
+// S11 FIX (2026-08-18): the failure predicate moved to lib/failedCategories.js
+// so the SW's `get_failed_businesses` action filters server-side with the EXACT
+// same algorithm this modal uses for display — one predicate, no drift, and the
+// whole-DB payload (the get-ALL-businesses action) no longer crosses the
+// message channel.
+import { categorizeFailure } from '../lib/failedCategories.js';
 
 // Add Failed Businesses Modal HTML
 const failedModalHTML = `
@@ -133,56 +139,8 @@ function closeFailedModal() {
     }
 }
 
-/**
- * Categorize a business into failure type
- * FIXED: Proper categorization logic without double-counting
- * 
- * @param {Object} business - Business object
- * @returns {string|null} - Category key or null if not a failure
- */
-function categorizeFailure(business) {
-    const hasWebsite = business.website && business.website.trim() !== '';
-    const wasScraped = business.emailScraped === true;
-    // E6 (ATP 2026-07-17): count "usable email" via the SSOT blacklist filter,
-    // NOT raw business.email truthiness. A business whose only emails are
-    // blacklisted/garbage has business.email truthy but cleanEmailsForCsv → '',
-    // so the raw check under-counted failures vs the authoritative CSV.
-    const hasEmail = cleanEmailsForCsv(business.email).trim() !== '';
-    const hasError = business.scrapeError && business.scrapeError.trim() !== '';
-
-    // If business has an email, it's not a failure
-    if (hasEmail) {
-        return null;
-    }
-
-    // Check for Cloudflare errors (highest priority for categorization)
-    if (hasError) {
-        const errorLower = business.scrapeError.toLowerCase();
-        if (errorLower.includes('cloudflare') ||
-            business.scrapeError === 'cloudflare_protected') {
-            return 'cloudflare';
-        }
-    }
-
-    // Business was scraped but no email found
-    if (wasScraped) {
-        if (hasError) {
-            // Had an error during scraping (timeout, fetch error, etc.)
-            return 'error';
-        } else {
-            // Scraped successfully but no email on site
-            return 'noEmail';
-        }
-    }
-
-    // Business has no website - couldn't be scraped
-    if (!hasWebsite) {
-        return 'noWebsite';
-    }
-
-    // Business not yet scraped, not a failure (pending)
-    return null;
-}
+// S11 (2026-08-18): categorizeFailure() moved VERBATIM to
+// lib/failedCategories.js (see import above) — shared with the SW filter.
 
 /**
  * Load and display failed businesses
@@ -196,9 +154,14 @@ async function loadFailedBusinesses() {
     listContainer.innerHTML = '<div class="loading-state">Loading failed businesses...</div>';
 
     try {
-        // Request all businesses from background script
-        // IMPORTANT: Background script must handle 'get_all_businesses' action
-        const response = await sendMessageWithRetry({ action: 'get_all_businesses' }, 3);
+        // S11 FIX (2026-08-18): request ONLY the failed subset. Pre-fix this
+        // sent the get-ALL-businesses action — the ENTIRE DB serialized through
+        // the message channel (multi-MB on 10K+ row DBs) just to filter
+        // client-side. The SW now filters with the SAME shared predicate
+        // (lib/failedCategories.js categorizeFailure) and returns the small
+        // subset plus `total` (whole-DB row count) so the empty-DB vs
+        // no-failures messages stay distinguishable.
+        const response = await sendMessageWithRetry({ action: 'get_failed_businesses' }, 3);
 
         if (!response) {
             throw new Error('No response from background script. Is it running?');
@@ -210,7 +173,7 @@ async function loadFailedBusinesses() {
 
         const businesses = response.businesses || [];
 
-        if (businesses.length === 0) {
+        if ((response.total ?? businesses.length) === 0) {
             listContainer.innerHTML = '<div class="empty-state">No businesses in database yet. Start monitoring and scraping first!</div>';
             updateCounts({ noEmail: [], cloudflare: [], error: [], noWebsite: [] });
             return;
@@ -265,6 +228,16 @@ async function loadFailedBusinesses() {
 
 /**
  * Send message with retry logic
+ *
+ * S11 FIX (2026-08-18): each attempt now goes through the shared UI-3/B10-3
+ * wrapper `window.sendMessageWithTimeout` (ui/messaging.js, loaded before this
+ * module — pinned by run-sidepanel-html-integrity/e6d) instead of raw
+ * chrome.runtime.sendMessage. Raw sendMessage NEVER rejects on SW silence —
+ * Chrome keeps the promise pending — so a single evicted-SW hiccup used to
+ * hang the modal forever on "Loading...". Now every attempt is bounded (15s
+ * default), the retry/backoff loop keeps its semantics, and after the last
+ * attempt the caller's error state renders (UI-4 Retry button).
+ *
  * @param {Object} message - Message to send
  * @param {number} maxRetries - Maximum retry attempts
  * @returns {Promise<Object>} - Response from background script
@@ -274,7 +247,7 @@ async function sendMessageWithRetry(message, maxRetries = 3) {
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            const response = await chrome.runtime.sendMessage(message);
+            const response = await window.sendMessageWithTimeout(message);
             return response;
         } catch (error) {
             lastError = error;
@@ -424,7 +397,11 @@ async function retryFailedFromModal() {
 
     try {
         // USE NEW DATABASE-BASED RETRY (works for businesses with no email found)
-        const response = await chrome.runtime.sendMessage({ action: 'retry_failed_businesses' });
+        // S11 FIX (2026-08-18): wrapped with the shared timeout helper — this
+        // was the last raw chrome.runtime.sendMessage in the modal (same
+        // SW-eviction hang risk UI-3 closed in storage-modal; ui/sidepanel.js
+        // :733 already calls this action through the wrapper).
+        const response = await window.sendMessageWithTimeout({ action: 'retry_failed_businesses' });
 
         // UI-01 FIX (2026-06-09): the retry_failed_businesses handler returns
         // { success, count } / { noFailed } / { success:false, error } — NOT a
@@ -471,10 +448,16 @@ async function exportFailedBusinesses() {
     }
 
     try {
-        const response = await sendMessageWithRetry({ action: 'get_all_businesses' });
+        // S11 FIX (2026-08-18): failed-only subset here too (second of the two
+        // former whole-DB load points). No cache is shared with
+        // loadFailedBusinesses on purpose: open and export are distinct user
+        // gestures, possibly minutes apart (a retry may have run in between) —
+        // a fresh small fetch is cheaper than a staleness bug.
+        const response = await sendMessageWithRetry({ action: 'get_failed_businesses' });
         const businesses = response?.businesses || [];
 
-        // Filter failed businesses using the same logic
+        // Defensive re-filter with the SAME shared predicate (no-op today —
+        // the SW already filtered with it; keeps the CSV honest if shapes drift)
         const failed = businesses.filter(b => categorizeFailure(b) !== null);
 
         if (failed.length === 0) {

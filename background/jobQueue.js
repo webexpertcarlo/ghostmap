@@ -151,6 +151,14 @@ export class JobQueue {
         // BGW-H2 FIX: Timer registry to prevent orphaned timers
         this._pendingTimers = new Set();
 
+        // S7 FIX (2026-08-18): ids of jobs currently in a retry-backoff
+        // window (retry timer scheduled, job neither in queue nor in
+        // activeJobs). Their session-ledger entry is kept alive across the
+        // window (see _executeJob retry branch) so SW eviction can't lose
+        // them; clear() uses this set to scrub those entries and prevent
+        // post-clear resurrection (BG-12 phantom-job class).
+        this._backoffJobIds = new Set();
+
         // M2-RACE1 FIX: Cancellation token for addJobsInBatches
         this._cancellationRequested = false;
 
@@ -447,6 +455,24 @@ export class JobQueue {
         // queue, but that one is harmless since the queue is empty).
         // Now: cancel all tracked pending timers as part of clear().
         this._clearPendingTimers();
+        // S7 FIX (2026-08-18): cancelling the retry timers above orphans any
+        // job whose only live reference was the backoff closure — but its
+        // session-ledger entry (kept alive across the backoff window) would
+        // resurrect it at the next SW boot, contradicting the explicit clear
+        // (same phantom-job class as BG-12). Scrub the ledger entries of
+        // backoff jobs AND of persistable jobs still in the queue (a
+        // fired-timer retry job re-enters the queue with its ledger entry
+        // still alive until re-dispatch). Active in-flight jobs keep their
+        // entries — clear() does not cancel those. Fire-and-forget: the
+        // writes are mutex-serialized and errors are logged inside.
+        const s7IdsToScrub = new Set(this._backoffJobIds);
+        for (const j of this.queue) {
+            if (j && j.persistable && j.type) s7IdsToScrub.add(j.id);
+        }
+        this._backoffJobIds.clear();
+        for (const id of s7IdsToScrub) {
+            this._unpersistActiveJob(id);
+        }
         this.queue = [];
         this._jobsAddedDuringProcessing = false; // M4-BUG1: Reset dirty flag on clear
         logger.info('Job queue cleared (queue + pending timers)');
@@ -702,6 +728,11 @@ export class JobQueue {
     async _executeJob(job) {
         // NOTE: job.id already added to activeJobs synchronously before this call
 
+        // S7 FIX: true when this attempt failed retry-eligible and a backoff
+        // timer was scheduled — the finally block must then KEEP the ledger
+        // entry (it's the only reference that survives SW eviction).
+        let retryScheduled = false;
+
         try {
             // DEFENSIVE FIX: Skip jobs with invalid functions (can happen from deserialization)
             if (typeof job.fn !== 'function') {
@@ -751,9 +782,40 @@ export class JobQueue {
                 this.stats.retried++;
 
                 // CRAWLEE FEATURE 1.5: Enhanced exponential backoff with jitter
-                const backoffDelay = this.calculateBackoff(job.retries - 1);
+                // S8 FIX (2026-08-18): a CIRCUIT_OPEN failure (the worker's
+                // domain-breaker gate) carries the breaker's RESIDUAL cooldown
+                // in error.retryAfterMs. Honor it: the generic 1-30s backoff
+                // would land while the circuit is still open and burn attempts
+                // against a gate that cannot pass. The S7 ledger persistence
+                // below makes even a long dedicated wait eviction-safe.
+                const backoffDelay = (error && Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0)
+                    ? Math.max(100, Math.round(error.retryAfterMs))
+                    : this.calculateBackoff(job.retries - 1);
 
                 logger.info(`[Retry] 🔄 Job ${job.id.slice(0, 12)}... retry ${job.retries}/${job.maxRetries} in ${backoffDelay}ms`);
+
+                // S7 FIX (2026-08-18): during the backoff window the job used
+                // to live ONLY in the setTimeout closure — the finally block
+                // below removed it from activeJobs AND from the session ledger,
+                // so an MV3 SW eviction inside the window silently lost it
+                // (boot recovery re-hydrates from the ledger only). Keep the
+                // ledger entry alive across the backoff: re-persist the job
+                // (updated retries) BEFORE scheduling the timer (persist →
+                // schedule ordering; a failed write is swallowed inside
+                // _persistActiveJob → degrades to pre-fix best-effort), and
+                // skip the unpersist in finally (retryScheduled flag).
+                //  - SW survives: the timer fires and the job re-enters the
+                //    queue; the next dispatch overwrites the SAME ledger entry
+                //    (keyed by job.id) and the final success/permanent-failure
+                //    path unpersists it — no duplicates, no zombies.
+                //  - SW evicted: _recoverOrphanedActiveJobs finds the entry at
+                //    boot and re-enqueues it once (dedup by id vs loadQueue).
+                //    Timer-path and recovery-path can never both run: recovery
+                //    only executes in a fresh SW, where old timers are dead.
+                // Closure jobs (no type) stay unpersistable — B6-2 concern.
+                retryScheduled = true;
+                this._backoffJobIds.add(job.id);
+                await this._persistActiveJob(job);
 
                 // Re-add to queue after delay
                 // BUG-009 FIX: Add additional guards to prevent race condition
@@ -761,6 +823,10 @@ export class JobQueue {
                 const retryJobId = job.id;
                 const retryTimerId = setTimeout(() => {
                     this._untrackTimer(retryTimerId);
+                    // S7: backoff window over — the job re-enters the queue;
+                    // its ledger entry stays until the re-dispatch overwrites
+                    // it (clear() scrubs persistable queue jobs, so no leak).
+                    this._backoffJobIds.delete(retryJobId);
                     // Verify job wasn't already processed or queue cleared
                     if (this.queue.some(j => j.id === retryJobId)) {
                         logger.debug(`[QUEUE] Job ${retryJobId} already in queue, skipping re-add`);
@@ -779,12 +845,25 @@ export class JobQueue {
 
             } else {
                 // Max retries reached
+                // S8 FIX (2026-08-18): a job that exhausted its retries because
+                // the domain circuit breaker never closed is a VISIBLE failure
+                // (processed/failed/failedJobs/onJobFailed below all fire) but
+                // NOT fresh evidence of system failure — the breaker itself is
+                // the source. Feeding it into consecutiveFailures (the queue's
+                // global circuit), the domain retry budget (the domain is
+                // already gated by the worker's breaker) or
+                // AutoScaler.recordResult(false) would self-amplify the open
+                // circuit (same convention as email-scraper-v2 ~1355-1358,
+                // which skips recordResult for blocking errors).
+                const isCircuitOpenFailure = !!(error && error.circuitOpen === true);
                 this.stats.processed++;
                 this.stats.failed++;
-                this.consecutiveFailures++;
+                if (!isCircuitOpenFailure) {
+                    this.consecutiveFailures++;
+                }
 
                 // PHASE 3 FIX #30: Track domain retry budget
-                if (job.domain) {
+                if (job.domain && !isCircuitOpenFailure) {
                     this._incrementDomainRetryBudget(job.domain);
                 }
 
@@ -808,7 +887,12 @@ export class JobQueue {
                 this._schedulePersistCircuit();
 
                 // PHASE 2: Record failure for AutoScaler adaptive concurrency
-                this.autoScaler.recordResult(false, { domain: job.domain, error: errorMessage });
+                // S8: circuit-open exhaustion is not a system failure signal.
+                if (!isCircuitOpenFailure) {
+                    this.autoScaler.recordResult(false, { domain: job.domain, error: errorMessage });
+                } else {
+                    logger.debug(`[AutoScaler] Skipping recordResult for circuit-open failure (domain already gated)`);
+                }
 
                 if (this.onJobFailed) {
                     this.onJobFailed(job, { message: errorMessage, stack: errorStack });
@@ -818,7 +902,11 @@ export class JobQueue {
             this.activeJobs.delete(job.id);
             // B6-1: also remove from active-jobs storage so it isn't re-queued
             // as orphaned on next loadQueue (post-eviction).
-            this._unpersistActiveJob(job.id);
+            // S7 FIX: EXCEPT while a retry backoff is pending — the ledger
+            // entry is then the only eviction-safe reference to the job.
+            if (!retryScheduled) {
+                this._unpersistActiveJob(job.id);
+            }
 
             // PHASE 2 FIX: Trigger AutoScaler evaluation after each job
             // IMPROVEMENT: Pass system status for system-aware scaling
@@ -1495,7 +1583,13 @@ export class JobQueue {
 
             if (!saved || saved.version !== 1) {
                 logger.debug('[JobQueue] No saved queue found or version mismatch');
-                return 0;
+                // S7 FIX (2026-08-18): the active-jobs ledger (session) is
+                // independent of the queue snapshot (local). Pre-fix this
+                // early return skipped _recoverOrphanedActiveJobs entirely
+                // whenever no snapshot existed (first boot of a session,
+                // post-clearSavedQueue), silently dropping jobs that were
+                // in-flight or in a retry-backoff window at eviction time.
+                return await this._recoverOrphanedActiveJobs();
             }
 
             // Filter out jobs that are too old (> 24 hours)

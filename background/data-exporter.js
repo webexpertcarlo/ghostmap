@@ -199,6 +199,18 @@ function serializeServiceOptions(arr) {
 }
 
 /**
+ * W2 (gosom-hardening 2026-07-22): serialize creditCards (accepted payment
+ * option names) → "Carte di credito; Carte di debito; PagamentI mobile NFC".
+ * Joined with "; " like the other list columns; each name is passed through
+ * escapeCsv by the caller, so a name containing a comma/quote can never shift
+ * columns. Empty / invalid input → empty string.
+ */
+function serializeCreditCards(arr) {
+    if (!Array.isArray(arr) || arr.length === 0) return '';
+    return arr.filter(s => typeof s === 'string' && s.length > 0).join('; ');
+}
+
+/**
  * Serialize a single coordinate as a fixed-precision float string.
  * Returns '' for null/non-finite values so the CSV cell stays empty.
  */
@@ -341,7 +353,17 @@ export function generateCSV(businesses) {
         // while keeping validated vs. unvalidated strictly distinguishable.
         // Appended at the END on purpose: every existing column index stays
         // stable for downstream consumers (see the CORE "DO NOT REORDER" note).
-        'Partita IVA (Raw/Unvalidated)'
+        // It was the last column until W2 (gosom-hardening 2026-07-22), which
+        // appended the three columns below AFTER it — the same append-only
+        // rationale keeps this column's index stable for existing consumers.
+        'Partita IVA (Raw/Unvalidated)',
+        // ── W2 (gosom-hardening 2026-07-22): order-online + accepted payments ──
+        // Extracted from the SEARCH-LIST state (inner[75] / inner[100]). Appended
+        // at the END so every pre-existing column index stays fixed (append-only
+        // invariant; header[] and row[] must add cells at the SAME tail index).
+        'Order Online URL',
+        'Order Online Source',
+        'Credit Cards'
     ];
 
     // RCA Root Cause B: drop provably out-of-radius rows (flag-gated, default ON).
@@ -451,7 +473,16 @@ export function generateCSV(businesses) {
         // ="…" wrapper does not double internal quotes and would column-shift on a
         // raw containing "). It is only ever populated when the checksum failed,
         // so a validated row leaves this cell empty.
-        escapeCsv(b.partitaIvaRaw || '')
+        escapeCsv(b.partitaIvaRaw || ''),
+        // ── W2 (gosom-hardening 2026-07-22): order-online + accepted payments ──
+        // Appended at the SAME tail index as the three new headers (alignment
+        // invariant). All three go through escapeCsv — the order-online URL and
+        // provider label are page-derived free text, and the creditCards names,
+        // though joined with "; ", are wrapped as a single escaped cell so an
+        // embedded comma/quote/formula-prefix can never shift columns.
+        escapeCsv(b.orderOnlineUrl || ''),
+        escapeCsv(b.orderOnlineSource || ''),
+        escapeCsv(serializeCreditCards(b.creditCards))
         ];
     });
 

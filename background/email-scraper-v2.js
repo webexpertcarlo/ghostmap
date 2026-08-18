@@ -27,7 +27,7 @@ import { sitemapDiscovery } from '../lib/SitemapDiscovery.js';
 // a concurrent detail-fetch enrichment wrote meanwhile. The merge re-reads the
 // CURRENT record inside one readwrite tx and applies only this job's `updates`.
 import { updateBusinessMerge } from '../lib/db.js';
-import { buildBusinessUpdates, mergeSocialLinks } from '../lib/businessUpdates.js'; // PIVA-01, BUG-3
+import { buildBusinessUpdates, mergeSocialLinks, CIRCUIT_OPEN_ERROR } from '../lib/businessUpdates.js'; // PIVA-01, BUG-3, S8
 import { setupOffscreenDocument } from './offscreen-manager.js'; // HIGH FIX #5
 // B4-1: SessionPool no longer eager-imported — resolved lazily via _getPool()
 // from ServiceContainer to preserve restoreFromStorage semantics. The unused
@@ -330,6 +330,47 @@ export async function isCircuitOpen(domain) {
 
         return (state.failures || 0) >= CIRCUIT_OPEN_THRESHOLD;
     });
+}
+
+// S8 (2026-08-18): clamps for the dedicated circuit-open retry delay.
+// The retry must land AFTER the breaker's residual cooldown (in the half-open
+// probe window) or it just burns a JobQueue attempt against a gate that cannot
+// pass. Floor covers "half-open budget exhausted by other workers" (residual
+// computes ≤0 → poll again soon); cap bounds escalated cooldowns (LC-2
+// multiplier up to 16× → hours) so a job never waits more than 10 minutes per
+// attempt — the S7 ledger keeps even that wait eviction-safe.
+const CIRCUIT_RETRY_BUFFER_MS = 2000;      // land safely past cooldown expiry
+const CIRCUIT_RETRY_MIN_MS = 15000;        // floor when residual ≤ 0
+const CIRCUIT_RETRY_MAX_MS = 600000;       // 10 min cap on escalated cooldowns
+
+/**
+ * S8: residual cooldown of an OPEN domain circuit, as a retry delay hint.
+ *
+ * Read-only (no mutex needed — no read-modify-write): mirrors the cooldown
+ * arithmetic of isCircuitOpen (adaptive band × LC-2 multiplier). Returns a
+ * value clamped to [CIRCUIT_RETRY_MIN_MS, CIRCUIT_RETRY_MAX_MS]; if the state
+ * vanished or the circuit is not actually open, returns the floor so the
+ * caller retries soon and re-checks the gate.
+ *
+ * @param {string} domain
+ * @returns {Promise<number>} suggested retry delay in ms (always > 0)
+ */
+export async function getCircuitRetryAfterMs(domain) {
+    let residualMs = 0;
+    try {
+        const all = await _circuitBreakerState.get();
+        const state = all[domain];
+        if (state && state.openedAt && (state.failures || 0) >= CIRCUIT_OPEN_THRESHOLD) {
+            const cooldownMs = getCooldownForError(state.lastError) * (state.cooldownMultiplier || 1);
+            residualMs = (state.openedAt + cooldownMs) - Date.now();
+        }
+    } catch {
+        // storage hiccup → fall through to the floor
+    }
+    return Math.min(
+        CIRCUIT_RETRY_MAX_MS,
+        Math.max(CIRCUIT_RETRY_MIN_MS, residualMs + CIRCUIT_RETRY_BUFFER_MS)
+    );
 }
 
 /**
@@ -1433,8 +1474,11 @@ export async function parseHTMLInOffscreen(html, url, parseHTMLDirect) {
  * @param {{googleMapsUrl: string, title: string, website: string, phone?: string, email?: string, priority?: number}} business - Business object from database
  * @param {string} [currentBusinessName] - Reference to update current business name for progress tracking
  * @param {(html: string, url: string) => Promise<{emails: string[], socialLinks: Object, contactLinks?: string[]}>} parseHTMLInOffscreenWrapper - Parser function wrapper
- * @returns {Promise<{emails: string[], socialLinks: Object, successfulPage: string|null, duration: number, italianTaxCodes?: {partitaIva: string|null, codiceFiscale: string|null}, skipped?: boolean, skipReason?: string}>} Scraping results with emails, social links, and metadata
- * @throws {Error} If critical error occurs (Cloudflare errors are caught and handled)
+ * @returns {Promise<{emails: string[], socialLinks: Object, successfulPage: string|null, duration: number, italianTaxCodes?: {partitaIva: string|null, codiceFiscale: string|null}}>} Scraping results with emails, social links, and metadata
+ * @throws {Error} If critical error occurs (Cloudflare errors are caught and handled).
+ *   S8: throws a retry-eligible CIRCUIT_OPEN error (circuitOpen:true,
+ *   retryAfterMs = residual breaker cooldown) when the domain circuit is open —
+ *   the JobQueue retries it instead of counting a silent success.
  */
 export async function scrapeEmailForBusiness(business, currentBusinessName, parseHTMLInOffscreenWrapper) {
     const startTime = Date.now();
@@ -1465,24 +1509,44 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
     }
 
     // FIX-003: Check circuit breaker BEFORE any network operations
+    //
+    // S8 FIX (2026-08-18) — skip-reason taxonomy at this boundary:
+    //   TRANSIENT-MASKED (must retry — this branch):
+    //     - circuit_open: the domain is temporarily gated; pre-fix this
+    //       returned {skipped:true} which the JobQueue counted SUCCESS —
+    //       nothing saved on the row, job completed, business silently never
+    //       enriched again in the run. Now it THROWS a retry-eligible
+    //       CIRCUIT_OPEN error carrying the breaker's residual cooldown
+    //       (retryAfterMs), so the JobQueue's standard, S7-eviction-safe
+    //       retry path re-attempts once the breaker can be half-open. If the
+    //       breaker outlives maxRetries, the job fails VISIBLY (stats.failed,
+    //       failedJobs, onJobFailed → buildCircuitOpenFailureUpdate marks the
+    //       row) — never a silent success.
+    //   PERMANENT-LEGITIMATE (stay non-throw / completed elsewhere):
+    //     - skipped_invalid_url (BUG-7): marked BEFORE enqueue, never fetched.
+    //     - cloudflare_protected: saved with its marker in the catch below.
+    //     - business deleted from DB: the 'email_scrape' factory returns null.
+    //     - tab-fallback-only circuit skip (scrapeWithTab): internal to the
+    //       job — the main result is still saved with lastError.
+    //   The gate deliberately does NOT recordCircuitFailure: hitting a closed
+    //   gate is not new evidence against the domain (no self-feeding).
     if (await isCircuitOpen(domain)) {
         const duration = Date.now() - startTime;
-        logger.warn(`[CIRCUIT] ⏭️ Skipping ${business.title} - domain ${domain} is circuit-open`);
+        const retryAfterMs = await getCircuitRetryAfterMs(domain);
+        logger.warn(`[CIRCUIT] ⏭️ ${business.title} - domain ${domain} is circuit-open, retry-eligible in ~${Math.round(retryAfterMs / 1000)}s`);
         _getStats().recordRequest({
             duration,
             success: false,
             domain,
             error: 'circuit_open'
         });
-        return {
-            emails: [],
-            socialLinks: {},
-            italianTaxCodes: { partitaIva: null, codiceFiscale: null },
-            successfulPage: null,
-            duration,
-            skipped: true,
-            skipReason: 'circuit_open'
-        };
+        const circuitError = new Error(CIRCUIT_OPEN_ERROR);
+        // Flags consumed by JobQueue._executeJob: retry with the dedicated
+        // delay; on permanent exhaustion don't feed consecutiveFailures /
+        // AutoScaler / domain budget (the breaker is already the gate).
+        circuitError.circuitOpen = true;
+        circuitError.retryAfterMs = retryAfterMs;
+        throw circuitError;
     }
 
     // Note: Business processed stats recorded at end with email status

@@ -38,6 +38,13 @@
     // flag value at install time and on demand.
     const FLAG_STATE_CHANNEL = 'gmp:detail:flag-state';
     const FLAG_REQUEST_CHANNEL = 'gmp:detail:flag-request';
+    // S2 FIX (2026-08-18): bridge ISOLATED→MAIN for the effective feature
+    // flag. The production default enable path (CONFIG.detailFetch.enabled,
+    // lib/config.js — file-based, extension-side) is INVISIBLE from MAIN
+    // world, so the request-handler gate below cannot consult it directly.
+    // observer.js start() computes the ISOLATED-visible enablement and
+    // pushes it here; we latch it in a closure variable.
+    const CONFIG_STATE_CHANNEL = 'gmp:detail:config-state';
 
     // Read a localStorage flag without throwing if storage is blocked
     // (some private-browsing modes). Falls back to false on any failure.
@@ -81,6 +88,15 @@
     /** Kill switch — set true after N consecutive failures. */
     let killSwitchTripped = false;
     let consecutiveFails = 0;
+
+    /**
+     * S2 FIX (2026-08-18): closure-latched mirror of the extension-side
+     * enablement (CONFIG.detailFetch.enabled OR the ISOLATED-world console
+     * toggle), pushed by observer.js via CONFIG_STATE_CHANNEL at start().
+     * Deny-by-default: until the push arrives, only the MAIN-local paths
+     * (localStorage / window.__gmpEnableDetailFetch) can open the gate.
+     */
+    let extensionConfigEnabled = false;
 
     /** Diagnostic counters (logged on demand). */
     const stats = {
@@ -495,6 +511,14 @@
         if (event.data?.type === FLAG_REQUEST_CHANNEL) {
             broadcastFlagState();
         }
+        // S2 FIX (2026-08-18): latch the ISOLATED-computed enablement.
+        // THREAT MODEL (honest): this channel is page-forgeable like every
+        // postMessage, but forging {enabled:true} grants NOTHING a page
+        // script cannot already do via `window.__gmpEnableDetailFetch=true`
+        // (same MAIN-world trust domain) — no new capability is added.
+        if (event.data?.type === CONFIG_STATE_CHANNEL) {
+            extensionConfigEnabled = event.data.enabled === true;
+        }
     });
 
     /**
@@ -534,6 +558,45 @@
         if (!msg || msg.type !== REQUEST_CHANNEL) return;
         const { id, payload } = msg;
         if (!id || !payload) return;
+        // S2 FIX (2026-08-18): re-check the feature flag and the kill-switch
+        // AT THE POINT OF ACTION, on every request. Pre-fix the handler
+        // executed an authenticated /maps/preview/place fetch for ANY
+        // well-formed forged postMessage even with the feature disabled —
+        // the flag only gated the ISOLATED-world SENDER (observer.js).
+        //
+        // HONEST THREAT MODEL (MAIN world — perfect isolation impossible):
+        //   GUARANTEED: feature disabled (CONFIG off + no local flags) ⇒ a
+        //     forged `gmp:detail:request` alone causes ZERO fetch; a tripped
+        //     kill-switch (closure-private, page-unreadable) is enforced
+        //     before any queueing. Rate-limit/concurrency cap unchanged.
+        //   NOT GUARANTEED: a page script that knows extension internals can
+        //     re-open the gate (window.__gmpEnableDetailFetch, localStorage,
+        //     or forging CONFIG_STATE_CHANNEL) and can call the documented
+        //     console reset hook for the kill-switch (M1, kept by design) —
+        //     the documented console toggles live in page context BY DESIGN,
+        //     so any gate they can open, a page script can open too. The fix
+        //     raises the bar from "post one message" to "deliberately target
+        //     this extension's internals"; it cannot eliminate MAIN-world
+        //     co-tenancy. DoS by request-spam is bounded by the existing
+        //     3-slot cap + backoff + kill-switch, unchanged here.
+        if (!isFeatureEnabled() && !extensionConfigEnabled) {
+            window.postMessage({
+                type: RESPONSE_CHANNEL,
+                id,
+                ok: false,
+                error: 'feature_disabled',
+            }, location.origin);
+            return;
+        }
+        if (killSwitchTripped) {
+            window.postMessage({
+                type: RESPONSE_CHANNEL,
+                id,
+                ok: false,
+                error: 'kill_switch_tripped',
+            }, location.origin);
+            return;
+        }
         // SEC-01: reject anything that isn't the exact shape observer.js sends.
         if (!isValidDetailPayload(payload)) {
             window.postMessage({

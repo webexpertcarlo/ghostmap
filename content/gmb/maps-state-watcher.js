@@ -127,7 +127,20 @@
     }
     const DEBUG = lsFlag('gmp.stateWatcherDebug') || !!window.__gmpStateWatcherDebug;
 
-    let lastMapJson = '';
+    // S1 PERF FIX (2026-08-18): the poll used to decide "changed?" by
+    // JSON.stringify-ing the ENTIRE accumulator every 4 s and comparing with
+    // the previous serialization — multi-MB main-thread work at the 5000-
+    // business cap (user-perceivable jank). Replaced with an O(1) version
+    // counter bumped at the accumulator's SINGLE mutation point (the
+    // first-occurrence-wins insert in mergeFromParsedJspb). Because existing
+    // records are never rewritten in place and never deleted, the counter
+    // tracks content change EXACTLY: no missed publish (every content change
+    // goes through the insert) and no spurious publish (a merge that adds
+    // nothing does not bump). If you ever add a NEW accumulator write path
+    // (in-place enrichment, deletion), it MUST bump `accumulatorVersion` or
+    // that change will never reach the ISOLATED world.
+    let accumulatorVersion = 0;      // bumped on every accumulator mutation
+    let lastPublishedVersion = -1;   // -1 forces a publish on the next data-bearing tick
     let pollStartedAt = Date.now();
     let pollHandle = null;
 
@@ -154,7 +167,21 @@
     // shipped). postcode is IT-gated so foreign postcodes are never dropped.
     const CANARY_POSTCODE_IT_RE = /^\d{5}$/;
     const CANARY_COUNTRY_RE = /^[A-Z]{2}$/;
-    const _driftStats = { canaryFailures: {}, recordsChecked: 0 };
+    // W2 (gosom-hardening 2026-07-22): validator for the orderOnline URL wired
+    // through getFirstValid + FIELD_PATHS. http(s) only — a validator-gated
+    // fallback path never ships a non-URL (worst case null).
+    const HTTP_URL_RE = /^https?:\/\//;
+    // Drift LEDGER (W1, gosom-hardening 2026-07-22): two buckets sharing one
+    // rate-limited warn channel.
+    //   canaryFailures    — an implausible value was DROPPED (last-line defense).
+    //   fallbackRecoveries — a primary index path missed but a KNOWN ALTERNATE
+    //                        recovered the value. A recovery is the earliest
+    //                        signal of a live Google index migration: it means
+    //                        the primary path already moved but the record is
+    //                        still correct because an alternate caught it. Watch
+    //                        this counter climb and you can promote the alternate
+    //                        to primary BEFORE exports corrupt.
+    const _driftStats = { canaryFailures: {}, fallbackRecoveries: {}, recordsChecked: 0 };
     let _lastCanaryWarnAt = 0;
     function _recordCanaryFailure(field) {
         _driftStats.canaryFailures[field] = (_driftStats.canaryFailures[field] || 0) + 1;
@@ -166,6 +193,28 @@
                     `[GhostMap state-watcher] JSPB drift canary FAILED on "${field}" — ` +
                     `partial index shift suspected (CID gate still passes). Implausible ` +
                     `value dropped. Counters: ${JSON.stringify(_driftStats.canaryFailures)}`
+                );
+            } catch { /* ignore */ }
+        }
+    }
+    /**
+     * Record that `fieldName` was recovered from candidate #`candidateIndex`
+     * (0 = primary; >0 = a fallback path). Routes through the SAME ≤30s warn
+     * throttle as `_recordCanaryFailure` — a fallback recovery IS an early
+     * drift signal and deserves the same operator-visible channel.
+     */
+    function _recordFallbackRecovery(fieldName, candidateIndex) {
+        const key = `${fieldName}:fellback[${candidateIndex}]`;
+        _driftStats.fallbackRecoveries[key] = (_driftStats.fallbackRecoveries[key] || 0) + 1;
+        const now = Date.now();
+        if (now - _lastCanaryWarnAt > 30000) {
+            _lastCanaryWarnAt = now;
+            try {
+                console.warn(
+                    `[GhostMap state-watcher] JSPB drift FALLBACK on "${fieldName}" — ` +
+                    `primary index path missed; recovered via alternate candidate #${candidateIndex}. ` +
+                    `Google may be migrating this index; promote the alternate before exports break. ` +
+                    `Counters: ${JSON.stringify(_driftStats.fallbackRecoveries)}`
                 );
             } catch { /* ignore */ }
         }
@@ -266,6 +315,111 @@
     }
 
     /**
+     * W1 (gosom-hardening 2026-07-22) — fallback-chain resolver.
+     * Return the first candidate path whose value exists AND passes `validate`.
+     * `paths` is an array of index-path arrays in preference order (current
+     * primary first, known-legacy/alternate next). Records a fallback recovery
+     * in the drift ledger IFF a non-primary candidate (i>0) is the one that
+     * succeeds — the early-warning signal of a live index migration. Returns
+     * null when no candidate is present-and-valid (null-parity with the old
+     * per-field guards).
+     *
+     * NOTE (semantics vs. applyDriftCanaries): for fields whose FIELD_PATHS
+     * validator IS the authoritative plausibility predicate (rating, country),
+     * an implausible PRIMARY now nulls HERE rather than being nulled+counted
+     * later by the canary. To preserve the drift telemetry the canary used to
+     * produce, such fields pass `canaryOnMiss=true`: when every candidate is
+     * absent-or-implausible AND a value was actually PRESENT (so it is drift,
+     * not a legitimately-missing field), getFirstValid records the same
+     * `canaryFailures[fieldName]` the old code did — and since the value is
+     * already nulled, applyDriftCanaries (unchanged, last line of defense) sees
+     * null and does not double-count. The IT-gated postcode deliberately does
+     * NOT set canaryOnMiss: its validator here is type-only and its real
+     * (\d{5}, IT-only) check stays in applyDriftCanaries so foreign postcodes
+     * are never judged. The shipped VALUE is unchanged (null either way).
+     */
+    function getFirstValid(root, paths, validate = (v) => v != null, fieldName, canaryOnMiss = false) {
+        let sawPresentInvalid = false;
+        for (let i = 0; i < paths.length; i++) {
+            const v = get(root, paths[i]);
+            if (v == null) continue;
+            if (validate(v)) {
+                if (i > 0 && fieldName) _recordFallbackRecovery(fieldName, i);
+                return v;
+            }
+            sawPresentInvalid = true;
+        }
+        if (sawPresentInvalid && canaryOnMiss && fieldName) _recordCanaryFailure(fieldName);
+        return null;
+    }
+
+    /**
+     * Declarative candidate table for the drift-prone fields wired through
+     * getFirstValid. Each entry: { paths: [ [idx...], ... ], validate }.
+     *
+     * Every field is SINGLE-CANDIDATE today. Empirically probed the real
+     * list-state fixture (maps-jspb-pizzerie-milano-2026-05-29, n=18,
+     * 2026-07-22): gosom's legacy hours/status alternates do NOT exist here —
+     * `[34]` is 0/18 populated and `[88][0]` carries a description string, not
+     * status/hours. So no alternate is invented (a validator-less or
+     * wrong-shaped fallback would be worse than today). The scaffold + ledger
+     * is the deliverable; candidates grow later, verified via the ledger loop.
+     */
+    const FIELD_PATHS = {
+        // finite number in [0,5] — same predicate the canary enforces, so
+        // canaryOnMiss preserves the old drift count when the primary drifts.
+        ratingDecimal: {
+            paths: [[4, 7]],
+            validate: (v) => typeof v === 'number' && isFinite(v) && v >= 0 && v <= 5,
+            canaryOnMiss: true
+        },
+        // ISO-3166 alpha-2 — same predicate the canary enforces.
+        countryCode: {
+            paths: [[243]],
+            validate: (v) => typeof v === 'string' && CANARY_COUNTRY_RE.test(v),
+            canaryOnMiss: true
+        },
+        // Type-only + NO canaryOnMiss: the \d{5} check is IT-GATED and stays in
+        // applyDriftCanaries (foreign postcodes must never be judged/dropped).
+        postcode: {
+            paths: [[183, 1, 4]],
+            validate: (v) => typeof v === 'string',
+            canaryOnMiss: false
+        },
+        openStatusShort: {
+            paths: [[203, 1, 8, 0]],
+            validate: (v) => typeof v === 'string',
+            canaryOnMiss: false
+        },
+        openStatusFull: {
+            paths: [[203, 1, 4, 0]],
+            validate: (v) => typeof v === 'string',
+            canaryOnMiss: false
+        },
+        // Root array of the weekly-hours subtree; extractWeeklyHours parses it.
+        hoursWeeklyRoot: {
+            paths: [[203, 0]],
+            validate: (v) => Array.isArray(v),
+            canaryOnMiss: false
+        },
+        // W2 (gosom-hardening 2026-07-22): the order-online URL, RELATIVE to the
+        // selected inner[75][0] action entry (see extractOrderOnline for the
+        // type===4 discrimination that no fixed path can express). Probed on the
+        // frozen list-state fixture (n=18, 2026-07-22): the URL lives at
+        // E[5][1][2][0]. gosom's single-place paths E[1][2] / E[0][2] are BOTH
+        // null in list-state (verified) — NOT copied (probe, don't copy gosom;
+        // W1 discipline: never invent an unverified alternate). Single-candidate
+        // today; the ledger/fallback scaffold grows candidates only when a real
+        // alternate is observed. URL-validated so a drift can only null, never
+        // ship a non-URL.
+        orderOnlineUrl: {
+            paths: [[5, 1, 2, 0]],
+            validate: (v) => typeof v === 'string' && HTTP_URL_RE.test(v),
+            canaryOnMiss: false
+        }
+    };
+
+    /**
      * Parse `"3.898 recensioni"` / `"3,898 reviews"` → 3898. Italian uses
      * "." as thousands separator; English uses ",". Both are normalized.
      */
@@ -335,6 +489,87 @@
     }
 
     /**
+     * W2 (gosom-hardening 2026-07-22) — order-online link from `inner[75]`.
+     *
+     * List-state sub-shape (probed on the frozen fixture, n=18, 2026-07-22 — it
+     * DIFFERS from gosom's single-place `darray`, so gosom's `[75][0][1][2]` /
+     * `[75][0][0][2]` are BOTH null here and must NOT be copied):
+     *   inner[75][0] = array of ACTION entries. For each entry `E`:
+     *     E[0]          = numeric type code — 4 = "Ordina online" (order-online),
+     *                     1 = "Prenota un tavolo" (reservation; already captured
+     *                     at inner[46]). The NUMERIC code is the locale-independent
+     *                     discriminator (the display label is Italian here).
+     *     E[5][1][2][0] = the action URL (wired via FIELD_PATHS.orderOnlineUrl,
+     *                     URL-validated through getFirstValid).
+     *     E[5][0]       = display label ("Ordina online") — locale-dependent.
+     *     E[2][0][0][0] = provider host (reservation aggregators like TheFork /
+     *                     guestplan expose it; order-online routes through
+     *                     Google's searchviewer redirect and has NO provider tree).
+     *
+     * Returns { url, source } for the FIRST type===4 entry whose URL validates,
+     * else null. `source` is the provider host when present, otherwise the
+     * display label (locale-dependent — documented; order-online in list-state
+     * carries no distinct provider, so the label is the best available signal).
+     */
+    function extractOrderOnline(inner) {
+        const entries = get(inner, [75, 0]);
+        if (!Array.isArray(entries)) return null;
+        for (const E of entries) {
+            if (!Array.isArray(E)) continue;
+            if (get(E, [0]) !== 4) continue; // order-online only; skip reservations (type 1)
+            const url = getFirstValid(E, FIELD_PATHS.orderOnlineUrl.paths, FIELD_PATHS.orderOnlineUrl.validate, 'orderOnlineUrl');
+            if (url == null) continue;
+            const provider = get(E, [2, 0, 0, 0]);
+            const label = get(E, [5, 0]);
+            const source = (typeof provider === 'string' && provider) ? provider
+                : (typeof label === 'string' && label) ? label : null;
+            return { url, source };
+        }
+        return null;
+    }
+
+    /**
+     * W2 (gosom-hardening 2026-07-22) — accepted payments ("creditCards").
+     *
+     * RELABEL of the same `inner[100][1]` amenity tree that feeds
+     * extractServiceOptions. Category matched on its STABLE code
+     * `cat[0] === 'payments'` (locale-independent) — with a locale-fragile
+     * display-name fallback (`/pagam|payment/i` on `cat[1]`) ONLY when the code
+     * is absent, since a future schema without stable codes would otherwise lose
+     * the field entirely. Option `present` uses the SAME convention as
+     * extractServiceOptions: `opt[2][0] === 1` means accepted (Maps' ✓); other
+     * values (e.g. `3` = "types accepted" sub-node) are excluded. Collects the
+     * display NAMES (opt[1]) of accepted options, deduped. Returns a non-empty
+     * string[] or null.
+     */
+    function extractCreditCards(inner) {
+        const cats = get(inner, [100, 1]);
+        if (!Array.isArray(cats)) return null;
+        const out = [];
+        const seen = new Set();
+        for (const cat of cats) {
+            if (!Array.isArray(cat)) continue;
+            const code = cat[0];
+            const name = cat[1];
+            const isPayments = code === 'payments'
+                || (code == null && typeof name === 'string' && /pagam|payment/i.test(name));
+            if (!isPayments) continue;
+            const opts = cat[2];
+            if (!Array.isArray(opts)) continue;
+            for (const opt of opts) {
+                if (!Array.isArray(opt)) continue;
+                const optName = opt[1];
+                const present = get(opt, [2, 0]) === 1;
+                if (present && typeof optName === 'string' && optName && !seen.has(optName)) {
+                    seen.add(optName);
+                    out.push(optName);
+                }
+            }
+        }
+        return out.length > 0 ? out : null;
+    }
+
+    /**
      * Price histogram: `inner[4][9][0]` is the array of buckets. Each is:
      *   [["E:EUR_10_TO_20","10-20 €","Da 10 € a 20 €"], [reviewCount, ratio, isPrimary], ...]
      */
@@ -375,7 +610,7 @@
      *   ["martedì", dayIdx, [Y,M,D], [["12:30–15",[[12,30],[15]]]], 0, 1]
      */
     function extractWeeklyHours(inner) {
-        const days = get(inner, [203, 0]);
+        const days = getFirstValid(inner, FIELD_PATHS.hoursWeeklyRoot.paths, FIELD_PATHS.hoursWeeklyRoot.validate, 'hoursWeeklyRoot');
         if (!Array.isArray(days)) return null;
         const out = [];
         for (const d of days) {
@@ -416,9 +651,11 @@
         if (typeof cid !== 'string' || !CID_RE.test(cid)) return null;
 
         const phone = extractPhone(inner);
+        const orderOnline = extractOrderOnline(inner);
         const reviewsText = get(inner, [4, 3, 1]);
         const reviewsCount = typeof inner[4]?.[8] === 'number' ? inner[4][8] : parseReviewsCount(reviewsText);
-        const ratingDecimal = typeof inner[4]?.[7] === 'number' ? inner[4][7] : null;
+        // W1: read drift-prone fields through the fallback-chain resolver.
+        const ratingDecimal = getFirstValid(inner, FIELD_PATHS.ratingDecimal.paths, FIELD_PATHS.ratingDecimal.validate, 'ratingDecimal', FIELD_PATHS.ratingDecimal.canaryOnMiss);
 
         return applyDriftCanaries({
             // identity
@@ -435,9 +672,9 @@
             addressLine2: typeof get(inner, [2, 1]) === 'string' ? inner[2][1] : null,
             street: typeof get(inner, [82, 1]) === 'string' ? inner[82][1] : null,
             city: typeof inner[166] === 'string' ? inner[166] : null,
-            postcode: typeof get(inner, [183, 1, 4]) === 'string' ? inner[183][1][4] : null,
+            postcode: getFirstValid(inner, FIELD_PATHS.postcode.paths, FIELD_PATHS.postcode.validate, 'postcode', FIELD_PATHS.postcode.canaryOnMiss),
             province: typeof get(inner, [183, 1, 5]) === 'string' ? inner[183][1][5] : null,
-            countryCode: typeof inner[243] === 'string' ? inner[243] : null,
+            countryCode: getFirstValid(inner, FIELD_PATHS.countryCode.paths, FIELD_PATHS.countryCode.validate, 'countryCode', FIELD_PATHS.countryCode.canaryOnMiss),
             languageCode: typeof inner[110] === 'string' ? inner[110] : null,
             timezone: typeof inner[30] === 'string' ? inner[30] : null,
             adminRegions: extractAdminRegions(inner),
@@ -462,8 +699,8 @@
             // Path: i[142][1][0] = [null, [[snippet_text, offsets], null, photo_url], null, total_reviews, ...]
             reviewSnippet: typeof get(inner, [142, 1, 0, 1, 0, 0]) === 'string' ? inner[142][1][0][1][0][0] : null,
             // status / hours
-            openStatusShort: typeof get(inner, [203, 1, 8, 0]) === 'string' ? inner[203][1][8][0] : null,
-            openStatusFull: typeof get(inner, [203, 1, 4, 0]) === 'string' ? inner[203][1][4][0] : null,
+            openStatusShort: getFirstValid(inner, FIELD_PATHS.openStatusShort.paths, FIELD_PATHS.openStatusShort.validate, 'openStatusShort', FIELD_PATHS.openStatusShort.canaryOnMiss),
+            openStatusFull: getFirstValid(inner, FIELD_PATHS.openStatusFull.paths, FIELD_PATHS.openStatusFull.validate, 'openStatusFull', FIELD_PATHS.openStatusFull.canaryOnMiss),
             hoursWeekly: extractWeeklyHours(inner),
             // media / owner
             primaryPhotoUrl: typeof get(inner, [37, 0, 0, 6, 0]) === 'string' ? inner[37][0][0][6][0] : null,
@@ -471,7 +708,11 @@
             ownerId: typeof get(inner, [57, 2]) === 'string' ? inner[57][2] : null,
             ownerPhotoUrl: typeof inner[157] === 'string' ? inner[157] : null,
             // amenities
-            serviceOptions: extractServiceOptions(inner)
+            serviceOptions: extractServiceOptions(inner),
+            // W2 (gosom-hardening): order-online link + accepted payments.
+            orderOnlineUrl: orderOnline ? orderOnline.url : null,
+            orderOnlineSource: orderOnline ? orderOnline.source : null,
+            creditCards: extractCreditCards(inner)
         });
     }
 
@@ -496,6 +737,7 @@
                 if (biz && biz.cid && !accumulatedBusinesses[biz.cid]) {
                     if (Object.keys(accumulatedBusinesses).length < ACCUMULATOR_CAP) {
                         accumulatedBusinesses[biz.cid] = biz;
+                        accumulatorVersion++; // S1: the ONLY accumulator write — dirty-mark for the poll
                         added++;
                     }
                 }
@@ -549,10 +791,12 @@
             const businesses = accumulatedBusinesses;
             const sizeB = Object.keys(businesses).length;
             if (sizeB > 0) {
-                const map = buildCidPhoneMap(businesses) || {};
-                const json = JSON.stringify({ b: businesses, m: map });
-                if (json !== lastMapJson) {
-                    lastMapJson = json;
+                // S1: O(1) dirty check — publish only when the accumulator
+                // actually changed since the last publish (or a fresh
+                // gmp:state-map-request forced lastPublishedVersion = -1).
+                if (accumulatorVersion !== lastPublishedVersion) {
+                    lastPublishedVersion = accumulatorVersion;
+                    const map = buildCidPhoneMap(businesses) || {};
                     const sizeP = Object.keys(map).length;
                     window.postMessage({
                         type: CHANNEL,
@@ -644,7 +888,10 @@
         // data-bearing direction (the gmp:state-map RESPONSE) is validated by
         // its consumer in observer.js (isolated world, CT-4).
         if (event.data?.type !== 'gmp:state-map-request') return;
-        lastMapJson = '';
+        // S1: force a republish on the next tick even if content is unchanged
+        // (a fresh/re-armed observer needs the current snapshot; the ISOLATED
+        // consumer merges idempotently, so an identical re-post is harmless).
+        lastPublishedVersion = -1;
         pollStartedAt = Date.now();
         if (!pollHandle) pollHandle = setInterval(tick, POLL_INTERVAL_MS);
         tick();
@@ -909,6 +1156,22 @@
      * lat, lng) tuple extracted from each card's href. See
      * `docs/MAPS_DETAIL_FETCH_REVERSE_ENGINEERING.md`.
      */
+    // Test-only internals hook (W1). Attached ONLY when the volatile flag
+    // `window.__gmpStateWatcherExposeInternals` is set — production never sets
+    // it, so this is a no-op in the extension. The Node test harness sets it
+    // before running the source to reach the IIFE internals (extractBusiness,
+    // getFirstValid, FIELD_PATHS, and the live drift ledger) without any
+    // production-visible surface change. Mirrors the existing DEBUG-flag style.
+    if (window.__gmpStateWatcherExposeInternals) {
+        window.__gmpStateWatcherTestHooks = {
+            extractBusiness,
+            getFirstValid,
+            get,
+            FIELD_PATHS,
+            driftStats: _driftStats
+        };
+    }
+
     installUrlChangeWatcher();
     maybeAutoReloadForState();
 

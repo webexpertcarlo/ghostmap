@@ -37,7 +37,11 @@ import { sitemapDiscovery } from '../lib/SitemapDiscovery.js';
 // BUG-7 (2026-07-07): shared invalid-URL skip marker + patch builder, so the
 // producer here, the retry-set filter (getFailedBusinessesFromDB) and the export
 // status (data-exporter.deriveScrapeStatus) key off ONE constant.
-import { buildInvalidUrlSkipUpdate, SKIPPED_INVALID_URL } from '../lib/businessUpdates.js';
+import { buildInvalidUrlSkipUpdate, SKIPPED_INVALID_URL, buildCircuitOpenFailureUpdate, CIRCUIT_OPEN_ERROR } from '../lib/businessUpdates.js';
+// S11 FIX (2026-08-18): shared "failed business" predicate (moved verbatim out
+// of ui/failed-modal.js) so the get_failed_businesses action filters with the
+// EXACT algorithm the modal displays — one predicate, no client/server drift.
+import { categorizeFailure } from '../lib/failedCategories.js';
 import { normalizeGoogleMapsUrl, getCanonicalDbKey } from '../lib/urlNormalizer.js';
 import { enrichmentRetryQueue } from '../lib/enrichmentRetryQueue.js';
 // SAVE-DLQ (2026-05-28): dead-letter recovery for save failures that survive the
@@ -672,6 +676,20 @@ function setupQueueCallbacks() {
         // Record failure metrics
         performanceMonitor.recordJob(0, false);
         performanceMonitor.recordError(error.message || 'unknown');
+
+        // S8 FIX (2026-08-18): an email_scrape job that exhausted ALL its
+        // retries because the domain circuit breaker never closed used to
+        // leave the business row untouched (emailScraped=false, no marker)
+        // while the queue moved on — an invisible permanent failure. Mark it
+        // with the BUG-7/cloudflare honesty convention (emailScraped:true +
+        // scrapeError:'circuit_open'): visible in the export as
+        // 'scrape_failed', listed in "Retry Failed" for a later manual run,
+        // out of the automatic candidate set (no silent loop). Fire-and-forget
+        // merge — a storage error must not break the queue callback.
+        if (error?.message === CIRCUIT_OPEN_ERROR && job?.params?.canonicalUrl) {
+            updateBusinessMerge(job.params.canonicalUrl, buildCircuitOpenFailureUpdate())
+                .catch(e => logger.warn(`[S8] Could not mark circuit-open failure for ${job.params.canonicalUrl}: ${e?.message || e}`));
+        }
     };
 }
 
@@ -1231,6 +1249,40 @@ async function handleMessage(message, sender) {
                     queue: jobQueue.getStatus()
                 };
 
+            // S11 FIX (2026-08-18): failed-only subset for ui/failed-modal.js.
+            // Pre-fix the modal called get_all_businesses (ENTIRE DB serialized
+            // through sendMessage, twice: open + export) and filtered
+            // client-side. Filter here with the SAME shared predicate the modal
+            // uses for display (lib/failedCategories.js categorizeFailure —
+            // includes the S8 scrapeError:'circuit_open' rows as 'error').
+            // NOTE: this is the DIAGNOSTIC set (what the user sees), a
+            // deliberate superset/sibling of the ACTIONABLE retry-set
+            // (lib/db.js getFailedBusinesses, used by retry_failed_businesses)
+            // — see lib/failedCategories.js header for the documented deltas.
+            // `total` = whole-DB row count, so the modal can distinguish
+            // "DB empty" from "no failures". get_all_businesses stays below
+            // untouched for compat.
+            case 'get_failed_businesses': {
+                try {
+                    const allBusinesses = await getBusinesses();
+                    const failedOnly = (allBusinesses || []).filter(b => categorizeFailure(b) !== null);
+                    return {
+                        status: 'success',
+                        businesses: failedOnly,
+                        count: failedOnly.length,
+                        total: allBusinesses?.length || 0
+                    };
+                } catch (error) {
+                    logger.error('[Background] get_failed_businesses failed:', error);
+                    return {
+                        status: 'error',
+                        error: error.message,
+                        businesses: [],
+                        total: 0
+                    };
+                }
+            }
+
             case 'get_all_businesses':
                 // AUDIT FIX: Added error handling and consistent response format
                 try {
@@ -1732,10 +1784,33 @@ async function handleBusinessBatch(businesses) {
     return results;
 }
 
+// S6 FIX (2026-08-18): single-flight guard for the START critical section
+// (same convention as website-extractor.js IDX-01 `_runLoopActive`). The
+// queue-status check below is a TOCTOU guard: it reads 0/0, then crosses
+// several awaits (DB candidate query, setupOffscreenDocument) before
+// addJobsInBatches enqueues the first job — so two close `start_email_scraping`
+// messages (double click, UI+API, channel retry) both passed it and enqueued
+// duplicate jobs for the same businesses. This flag is checked-and-set
+// SYNCHRONOUSLY (same tick, before any await) and released in `finally` on
+// every exit path (started / no_targets / throw). Lifecycle: it covers ONLY
+// the start section — once addJobsInBatches has synchronously enqueued the
+// first batch, the existing queue-status guard owns the "run in progress"
+// phase. Module variable = same-SW-lifetime scope, which is exactly right:
+// across eviction it resets together with the in-memory queue state.
+let _emailStartInFlight = false;
+
 /**
  * Start email scraping batch - NON-BLOCKING VERSION
  */
 async function startEmailScraping() {
+    // S6: synchronous check-and-set BEFORE any await — an async check here
+    // would be theater (the concurrent second start lands in the same tick).
+    if (_emailStartInFlight) {
+        const queueStatus = jobQueue.getStatus();
+        logger.warn(`Email scraping start already in flight — second start rejected (S6). ${queueStatus.pending} pending, ${queueStatus.active} active jobs.`);
+        return { status: 'already_running', pending: queueStatus.pending, active: queueStatus.active };
+    }
+    _emailStartInFlight = true;
     try {
         // Check if scraping is already in progress
         const queueStatus = jobQueue.getStatus();
@@ -1821,6 +1896,12 @@ async function startEmailScraping() {
             stack: error.stack
         });
         throw error;
+    } finally {
+        // S6: release on EVERY exit path. On success this runs after
+        // addJobsInBatches() has synchronously enqueued the first batch, so
+        // the queue-status guard is already armed for the running phase; on
+        // no_targets / throw it reopens the window for an honest retry.
+        _emailStartInFlight = false;
     }
 }
 

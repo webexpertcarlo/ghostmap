@@ -259,6 +259,22 @@ export class DOMObserver {
             // flag — covers the case where the install-time broadcast
             // landed before our listener was armed.
             window.postMessage({ type: 'gmp:detail:flag-request' }, location.origin);
+            // S2 FIX (2026-08-18): bridge ISOLATED→MAIN for the effective
+            // enablement. The MAIN-world detail-fetcher now re-checks the
+            // feature flag INSIDE its gmp:detail:request handler (defence in
+            // depth vs forged page messages), but CONFIG.detailFetch.enabled
+            // (file-based, extension-side) and the ISOLATED-world console
+            // toggle are invisible from MAIN world — push them across so the
+            // legitimate default-on flow keeps working. localStorage and the
+            // MAIN window flag are already MAIN-visible, no need to mirror.
+            {
+                const configEnabled = (CONFIG.detailFetch && CONFIG.detailFetch.enabled === true)
+                    || (typeof window !== 'undefined' && window.__gmpEnableDetailFetch === true);
+                window.postMessage({
+                    type: 'gmp:detail:config-state',
+                    enabled: configEnabled
+                }, location.origin);
+            }
 
             // B2-1 FIX (2026-05-10): periodic re-arm of the watcher poll.
             // The MAIN-world watcher (maps-state-watcher.js:115,542) caps
@@ -1190,6 +1206,10 @@ export class DOMObserver {
                 if (stateBiz.reviewSnippet) business.reviewSnippet = stateBiz.reviewSnippet;
                 if (Array.isArray(stateBiz.serviceOptions)) business.serviceOptions = stateBiz.serviceOptions;
                 if (stateBiz.searchResultType) business.searchResultType = stateBiz.searchResultType;
+                // W2 (gosom-hardening 2026-07-22): order-online link + accepted payments.
+                if (stateBiz.orderOnlineUrl) business.orderOnlineUrl = stateBiz.orderOnlineUrl;
+                if (stateBiz.orderOnlineSource) business.orderOnlineSource = stateBiz.orderOnlineSource;
+                if (Array.isArray(stateBiz.creditCards)) business.creditCards = stateBiz.creditCards;
             }
 
             // ========== PATCH: Website fallback for hotels ==========
