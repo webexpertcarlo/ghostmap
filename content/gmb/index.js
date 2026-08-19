@@ -162,17 +162,39 @@ function _writePendingBusinesses(arr) {
 }
 
 function _appendPendingBusiness(business) {
-    // S4 FIX: the read-modify-write runs under the cross-tab lock so a
-    // concurrent flush rewrite (or append) in another tab can't erase it.
-    // Returns a promise that never rejects (fn is fully try/catch'd inside
-    // read/write; lock failures degrade to a direct run) — callers may
-    // stay fire-and-forget.
+    // R6 FIX (2026-08-19): write SYNCHRONOUSLY first, reconcile under the
+    // lock second.
+    // S4 moved this whole read-modify-write inside _withQueueLock, which
+    // closed the cross-tab clobber but opened a new loss window: the
+    // setItem then happened only after the lock was GRANTED, and every
+    // caller is fire-and-forget, so a tab killed while another tab held the
+    // lock lost the business entirely — pre-S4 it was already on disk.
+    // Durability first: the record hits localStorage in this tick, so a
+    // navigation/close/crash from here on cannot lose it.
+    const record = { business, ts: Date.now() };
+    const pending = _readPendingBusinesses();
+    pending.push(record);
+    _writePendingBusinesses(pending);
+    if (pending.length >= PENDING_BUSINESSES_CAP) {
+        logger.warn(`[B2-7] Pending businesses queue at cap (${PENDING_BUSINESSES_CAP}); oldest entries will be dropped`);
+    }
+    // S4 guarantee, preserved: this sync write is an unlocked RMW, so a
+    // concurrent tab's write can still clobber it. Re-read under the lock and
+    // restore the record if it is gone. Identity is the JSON of the record
+    // ({business, ts} with ms-precision ts).
+    // Trade-off (accepted, same reasoning as S4's two-concurrent-flushes
+    // case): if the record was legitimately DELIVERED and dequeued inside
+    // this window, the reconcile re-appends it and it may be sent twice —
+    // benign, because business_found is an idempotent fill-holes upsert that
+    // answers 'duplicate' and self-dequeues. Losing it would be irreversible.
+    // Returns a promise that never rejects (read/write are fully try/catch'd;
+    // lock failures degrade to a direct run) — callers stay fire-and-forget.
+    const recordKey = JSON.stringify(record);
     return _withQueueLock(() => {
-        const pending = _readPendingBusinesses();
-        pending.push({ business, ts: Date.now() });
-        _writePendingBusinesses(pending);
-        if (pending.length >= PENDING_BUSINESSES_CAP) {
-            logger.warn(`[B2-7] Pending businesses queue at cap (${PENDING_BUSINESSES_CAP}); oldest entries will be dropped`);
+        const current = _readPendingBusinesses();
+        if (!current.some((e) => JSON.stringify(e) === recordKey)) {
+            current.push(record);
+            _writePendingBusinesses(current);
         }
     });
 }
