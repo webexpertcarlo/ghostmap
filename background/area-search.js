@@ -123,6 +123,16 @@ const CAPTCHA_DOMAIN = '_global_captcha_'; // Special domain for global CAPTCHA 
 const CaptchaDetector = {
     consecutiveFailures: 0,
 
+    // S10-bis (2026-08-19): CAPTCHA evidence lives on its own counter.
+    // consecutiveFailures counts window-CREATION failures and is zeroed by
+    // reportSuccess() at the end of every batch that opened at least one
+    // window — which happens BEFORE the next batch's zero-result audit. Feeding
+    // CAPTCHA hits into that same counter (S10) made the threshold unreachable:
+    // with parallelTabs <= 2 at most 2 hits fit in one batch. "Chrome opened a
+    // window" is not evidence that Google is not serving an interstitial, so
+    // the two signals must not share a counter.
+    consecutiveCaptchaHits: 0,
+
     async checkForCaptcha(tabId) {
         try {
             const results = await chrome.scripting.executeScript({
@@ -147,31 +157,56 @@ const CaptchaDetector = {
         }
     },
 
+    // Opens the unified breaker and tells the user. Shared by both evidence
+    // channels (window-creation failures and CAPTCHA-blocked cells) so they
+    // keep identical downstream semantics.
+    _tripBreaker() {
+        recordCircuitFailure(CAPTCHA_DOMAIN, 'CAPTCHA');
+        console.error('[CAPTCHA] Circuit breaker OPEN via unified module');
+
+        // B12-2 FIX (2026-05-10): UI listener wired in ui/sidepanel.js
+        // (Activity Feed entry + error toast) and ui/area-search-modal.js
+        // (in-modal warning banner). PO decision was made: surface the
+        // signal to the user — invisible CAPTCHA detection caused users
+        // to think the extension was broken when scraping silently halted.
+        // .catch(()=>{}) absorbs the "Receiving end does not exist"
+        // error when both sidepanel and modal are closed (rare but valid).
+        chrome.runtime.sendMessage({
+            action: 'area_search_captcha_detected',
+            payload: {
+                cooldownMs: getRemainingCooldown(CAPTCHA_DOMAIN),
+                resumeAt: Date.now() + getRemainingCooldown(CAPTCHA_DOMAIN)
+            }
+        }).catch(() => { });
+    },
+
     // C8 FIX: Delegate to unified CircuitBreaker
     reportFailure() {
         this.consecutiveFailures++;
         console.warn(`[CAPTCHA] Failure count: ${this.consecutiveFailures}`);
 
         if (this.consecutiveFailures >= 3) {
-            // Use unified circuit breaker with CAPTCHA error type
-            recordCircuitFailure(CAPTCHA_DOMAIN, 'CAPTCHA');
-            console.error('[CAPTCHA] Circuit breaker OPEN via unified module');
-
-            // B12-2 FIX (2026-05-10): UI listener wired in ui/sidepanel.js
-            // (Activity Feed entry + error toast) and ui/area-search-modal.js
-            // (in-modal warning banner). PO decision was made: surface the
-            // signal to the user — invisible CAPTCHA detection caused users
-            // to think the extension was broken when scraping silently halted.
-            // .catch(()=>{}) absorbs the "Receiving end does not exist"
-            // error when both sidepanel and modal are closed (rare but valid).
-            chrome.runtime.sendMessage({
-                action: 'area_search_captcha_detected',
-                payload: {
-                    cooldownMs: getRemainingCooldown(CAPTCHA_DOMAIN),
-                    resumeAt: Date.now() + getRemainingCooldown(CAPTCHA_DOMAIN)
-                }
-            }).catch(() => { });
+            this._tripBreaker();
         }
+    },
+
+    // S10-bis: a cell whose 0 results were a confirmed CAPTCHA/interstitial.
+    // Same threshold and same breaker as reportFailure, separate evidence.
+    reportCaptchaHit() {
+        this.consecutiveCaptchaHits++;
+        console.warn(`[CAPTCHA] Blocked-cell count: ${this.consecutiveCaptchaHits}`);
+
+        if (this.consecutiveCaptchaHits >= 3) {
+            this._tripBreaker();
+        }
+    },
+
+    // S10-bis: real counter-evidence — a cell that actually returned
+    // businesses proves the session is being served. Keeps the counter
+    // CONSECUTIVE. A legitimately empty cell is ambiguous and calls neither
+    // this nor reportCaptchaHit, so S10's rural false-positive guard stands.
+    reportCleanCell() {
+        this.consecutiveCaptchaHits = 0;
     },
 
     // C8 FIX: Delegate to unified CircuitBreaker
@@ -183,10 +218,11 @@ const CaptchaDetector = {
     // C8 FIX: Delegate to unified CircuitBreaker
     canProceed() {
         const isOpen = isCircuitOpenForDomain(CAPTCHA_DOMAIN);
-        if (!isOpen && this.consecutiveFailures >= 3) {
+        if (!isOpen && (this.consecutiveFailures >= 3 || this.consecutiveCaptchaHits >= 3)) {
             // Circuit recovered
             console.log('[CAPTCHA] Circuit breaker CLOSED via unified module');
             this.consecutiveFailures = 0;
+            this.consecutiveCaptchaHits = 0;
         }
         return !isOpen;
     },
@@ -222,22 +258,25 @@ const CaptchaDetector = {
  * and does NOT feed the breaker. A dead/closed tab is absorbed by
  * checkForCaptcha's internal try/catch (returns false): flow preserved.
  *
- * On a confirmed hit, feeds the EXISTING breaker path — same
- * CaptchaDetector.reportFailure() the window-creation failures use
- * (threshold 3 → unified CircuitBreaker opens + area_search_captcha_detected
- * broadcast; the next batch pauses in createTabsWithRecovery.canProceed).
- * No new breaker semantics invented.
+ * On a confirmed hit, opens the SAME unified breaker at the same threshold of
+ * 3 (+ area_search_captcha_detected broadcast; the next batch pauses in
+ * createTabsWithRecovery.canProceed), but through the CAPTCHA-specific
+ * counter. S10-bis (2026-08-19): S10 called reportFailure(), whose counter
+ * reportSuccess() zeroes once per batch, so the threshold was unreachable —
+ * see the note on CaptchaDetector.consecutiveCaptchaHits.
  *
  * @param {number} tabId - tab of the cell that yielded 0 businesses
  * @returns {Promise<boolean>} true if a CAPTCHA/interstitial was confirmed
  *
- * Spec & regression test: tests/run-s10-area-search-captcha-cell-audit-node.mjs
+ * Spec & regression tests:
+ *   tests/run-s10-area-search-captcha-cell-audit-node.mjs
+ *   tests/run-s10bis-captcha-evidence-sticky-node.mjs
  */
 async function _auditZeroResultCell(tabId) {
     const isCaptcha = await CaptchaDetector.checkForCaptcha(tabId);
     if (!isCaptcha) return false;
     console.warn(`[CAPTCHA] Tab ${tabId}: 0-result cell is a CAPTCHA/interstitial page — feeding breaker, cell marked not-searched`);
-    CaptchaDetector.reportFailure();
+    CaptchaDetector.reportCaptchaHit();
     return true;
 }
 
@@ -2012,6 +2051,15 @@ async function runTurboV3() {
                             captchaCells++;
                             continue;
                         }
+                    }
+
+                    // S10-bis: a cell that actually returned businesses is the
+                    // only real evidence that Google is still serving us, so it
+                    // is what resets the consecutive blocked-cell counter. A
+                    // 0-result cell without markers stays ambiguous and resets
+                    // nothing.
+                    if (businesses.length > 0) {
+                        CaptchaDetector.reportCleanCell();
                     }
 
                     for (const biz of businesses) {
@@ -3878,7 +3926,7 @@ export { _bindOrphanWindowCleanup };
 export { selectGeocodeResult };
 // S10 (2026-08-18): exported for tests/run-s10-area-search-captcha-cell-audit-node.mjs.
 // Internal 0-result-cell CAPTCHA audit — NOT public API.
-export { _auditZeroResultCell };
+export { _auditZeroResultCell, CaptchaDetector };
 // M15 (2026-08-18): exported for tests/run-m15-crashed-cell-accounting-node.mjs.
 // Internal Step-5 extractor — NOT public API. Failure contract: null = cell
 // NOT searched (tab crashed/closed, frame destroyed); [] = legit empty cell.
