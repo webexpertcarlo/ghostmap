@@ -713,15 +713,20 @@ function handleComplete(result) {
     // Close modal first to show main UI
     closeAreaSearchModal();
 
-    // CRITICAL FIX: Trigger sidepanel stats refresh to load new businesses
-    // This will update the business count and make them visible
-    chrome.runtime.sendMessage({ action: 'get_stats' }).then(() => {
-        // The sidepanel auto-refreshes stats every 5 seconds anyway,
-        // but we trigger immediate refresh for better UX
+    // M17-4 FIX (2026-08-19): trigger a REAL sidepanel stats refresh.
+    // Pre-fix this sent {action:'get_stats'} to the SW and threw the response
+    // away — a ghost round-trip that refreshed nothing (get_stats is
+    // request/response to the SENDER; the sidepanel never saw it), justified
+    // by a comment claiming a 5-second sidepanel auto-refresh (the fallback
+    // poll is actually every 3s — sidepanel.js statsRefreshInterval).
+    // The modal shares the page with sidepanel.js, which exports the actual
+    // refresh as window.GhostMapUI.loadStats (it catches its own errors).
+    try {
+        window.GhostMapUI?.loadStats?.();
         console.log('[AREA SEARCH] Stats refresh triggered');
-    }).catch(err => {
+    } catch (err) {
         console.warn('[AREA SEARCH] Stats refresh failed:', err);
-    });
+    }
 
     // OBS-4 (2026-05-17): stats are now DB-truth (post-reconciliation in
     // finishTurbo). Display total + this-run breakdown so the user sees

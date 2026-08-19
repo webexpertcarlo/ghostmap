@@ -210,6 +210,54 @@ const sendMessageWithTimeout = window.sendMessageWithTimeout;
 // ============================================
 // INITIALIZATION
 // ============================================
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M16 FIX (2026-08-18): resync email-scraping run state on sidepanel (re)open.
+// Pre-fix, reopening the panel during an ACTIVE run showed "Idle" with Start
+// enabled — only stats were reloaded, never run state (the area-search modal
+// already resyncs via get_area_search_status; email scraping had nothing).
+// Post-S6 a duplicate Start gets `already_running`, but the UI stayed
+// incoherent. We query the EXISTING pure-read action `get_queue_status`
+// (background/index.js → jobQueue.getStatus()) through the shared B10-3
+// wrapper.
+//   • active = (pending + active + backoff) > 0 AND !isPaused:
+//       - backoff counts as live work (R2-F1: jobs inside a retry-backoff
+//         window are neither pending nor active);
+//       - a user "Stop" is jobQueue.pause() with jobs left queued (SW
+//         stopEmailScraping) — resyncing that to "running" would silently
+//         undo the user's Stop, so isPaused wins.
+//   • Race vs push messages: initialize() AWAITS this BEFORE registering
+//     handleBackgroundMessage, so a fresher push (email_scraping_finished,
+//     phase2_heartbeat) always lands after the resync — a stale resync
+//     response can never overwrite a fresher pushed state.
+//   • SW unreachable / timeout ⇒ keep the default Idle (pre-fix behavior).
+//     Explicit 4s timeout (not the wrapper's 15s default) so a hung SW
+//     cannot stall listener registration for the whole init.
+// Progress numbers are NOT restored here: the phase2_heartbeat push (every
+// 2s while a batch is active) repopulates the bar right after the listener
+// registers — duplicating that would just race it.
+// ═══════════════════════════════════════════════════════════════════════════
+const RUN_RESYNC_TIMEOUT_MS = 4000;
+
+async function resyncEmailRunState() {
+    try {
+        const queueStatus = await sendMessageWithTimeout(
+            { action: 'get_queue_status' }, RUN_RESYNC_TIMEOUT_MS);
+        const inFlight = (queueStatus?.pending || 0)
+            + (queueStatus?.active || 0)
+            + (queueStatus?.backoff || 0);
+        if (inFlight > 0 && queueStatus?.isPaused !== true) {
+            state.isExtractingEmails = true;
+            updateEmailExtractionUI(true);
+        }
+        // else: queue empty or user-paused — keep the default Idle UI.
+    } catch (error) {
+        // Timeout / SW unreachable: default Idle, same as pre-fix. Never
+        // rethrow — a resync failure must not trip the init error boundary.
+        console.warn('[GhostMap] Email run-state resync failed (defaulting to Idle):', error?.message);
+    }
+}
+
 async function initialize() {
     console.log('[GhostMap] Initializing sidepanel v9.0.1...');
 
@@ -223,6 +271,11 @@ async function initialize() {
 
         // Load settings
         await loadSettings();
+
+        // M16 FIX: restore run-active UI if an email-scraping run survives in
+        // the SW. MUST settle before the push listener below registers (see
+        // resyncEmailRunState docblock for the race rationale).
+        await resyncEmailRunState();
 
         // Setup message listener
         chrome.runtime.onMessage.addListener(handleBackgroundMessage);
@@ -1674,7 +1727,14 @@ function handleBackgroundMessage(message, sender, sendResponse) {
             }
             break;
 
-        case 'newBusiness':
+        // Census 2026-08-19 (§5.4): orphan aliases removed from this dispatcher —
+        // no sender anywhere in the repo emitted: newBusiness, emailFound,
+        // emailScrapeProgress, email_scrape_progress, websiteProgress,
+        // website_progress, websiteExtractionComplete, website_extraction_complete,
+        // scrapingFailed, scraping_failed, statsUpdate, stats_update.
+        // Live equivalents kept below: business_found, email_found,
+        // scraping_progress, website_extraction_progress/finished.
+        // Pinned by tests/run-census-dead-code-node.mjs.
         case 'business_found':
 
             addActivity({
@@ -1685,7 +1745,6 @@ function handleBackgroundMessage(message, sender, sendResponse) {
             loadStats();
             break;
 
-        case 'emailFound':
         case 'email_found':
             // UI-03 FIX (2026-06-09): the SW broadcasts the address under
             // payload.email (background/index.js:1914); read that first so the
@@ -1698,8 +1757,6 @@ function handleBackgroundMessage(message, sender, sendResponse) {
             loadStats();
             break;
 
-        case 'emailScrapeProgress':
-        case 'email_scrape_progress':
         case 'scraping_progress':  // FIX: This is what background actually sends
             // Handle both flat and nested payload formats
             const progressData = message.payload || message;
@@ -1760,37 +1817,6 @@ function handleBackgroundMessage(message, sender, sendResponse) {
             state._lastCircuitOpen = nowCircuitOpen;
             break;
         }
-
-        case 'websiteProgress':
-        case 'website_progress':
-            updateWebsiteProgress({
-                current: message.current || 0,
-                total: message.total || 0,
-                percent: message.percent || 0,
-                message: message.message
-            });
-            break;
-
-        case 'websiteExtractionComplete':
-        case 'website_extraction_complete':
-            state.isExtractingWebsites = false;
-            showToast(`✓ Website extraction complete`, 'success');
-            loadStats();
-            break;
-
-        case 'scrapingFailed':
-        case 'scraping_failed':
-            addActivity({
-                name: message.url || message.business?.title || 'Unknown',
-                status: 'error',
-                detail: message.error || 'failed'
-            });
-            break;
-
-        case 'statsUpdate':
-        case 'stats_update':
-            updateStats(message.stats || message);
-            break;
 
         // ============================================
         // CRITICAL FIX: 8 Missing Message Handlers

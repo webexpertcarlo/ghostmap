@@ -334,13 +334,16 @@ const _TURBO_DEFAULTS = Object.freeze({
     isRunning: false,
     isPaused: false,
     currentBatch: 0,
+    // M17-3: batches sliced away by the H-002 memory cleanup (which resets
+    // the currentBatch cursor). Display counter = currentBatch + batchesTrimmed.
+    batchesTrimmed: 0,
     totalBatches: 0,
     completedSearches: 0,
     totalSearches: 0,
     searches: [],
     startTime: null,
     consecutiveLowYield: 0,
-    stats: { businessesFound: 0, withWebsite: 0, withPhone: 0, withEmail: 0 },
+    stats: { businessesFound: 0, withWebsite: 0, withPhone: 0 },
     config: {}
 });
 
@@ -351,13 +354,14 @@ const _turboInMemory = {
     isRunning: false,
     isPaused: false,
     currentBatch: 0,
+    batchesTrimmed: 0, // M17-3: see _TURBO_DEFAULTS
     totalBatches: 0,
     completedSearches: 0,
     totalSearches: 0,
     searches: [],
     startTime: null,
     consecutiveLowYield: 0,
-    stats: { businessesFound: 0, withWebsite: 0, withPhone: 0, withEmail: 0 },
+    stats: { businessesFound: 0, withWebsite: 0, withPhone: 0 },
     config: {},
     openTabs: new Set()
 };
@@ -530,6 +534,16 @@ _restoreTurboState()
             queueMicrotask(() => {
                 if (!_runLoopActive) {
                     _runLoopActive = true;
+                    // R5-F5 FIX (2026-08-19): chi riprende un flusso arma il
+                    // keepalive (pattern R2-F2). index.js wira questo hook a
+                    // startKeepAlive('area-search') — idempotente quando
+                    // l'alarm persistito è sopravvissuto, salvavita quando la
+                    // finestra F8 (self-heal pre-restore) l'ha cancellato.
+                    try {
+                        if (_onRunResumed) _onRunResumed('eviction_respawn');
+                    } catch (err) {
+                        console.warn('[TURBO_STATE] onRunResumed hook failed:', err?.message || err);
+                    }
                     // AS-01 FIX (2026-06-10): the interrupted batch's popups are
                     // orphans (their owner loop died with the SW). Close them
                     // BEFORE the respawned loop redoes the batch and creates new
@@ -728,6 +742,7 @@ function _makeRunLoopSentinel() {
 function resetTurboState() {
     _turboInMemory.searches = [];
     _turboInMemory.currentBatch = 0;
+    _turboInMemory.batchesTrimmed = 0; // M17-3: no carry-over between runs
     _turboInMemory.totalBatches = 0;
     _turboInMemory.completedSearches = 0;
     _turboInMemory.totalSearches = 0;
@@ -735,11 +750,18 @@ function resetTurboState() {
     _turboInMemory.isPaused = false;
     _turboInMemory.startTime = null;
     _turboInMemory.consecutiveLowYield = 0;
+    // Census 2026-08-19 (§5.11): the phantom email counter (`with…Email: 0`)
+    // was removed from this stats shape — initialized/reset but never
+    // incremented (_applyBatchStatsToTurbo omits it: emails arrive in the
+    // LATER enrichment phase, not during area search) and never read
+    // (area-search-modal shows withWebsite/withPhone; the sidepanel's email
+    // stat is the separate DB aggregate from lib/db.js getStats). Deliberately
+    // NOT spelled out here: tests/run-census-dead-code-node.mjs greps this
+    // file for the bare identifier to prevent resurrection.
     _turboInMemory.stats = {
         businessesFound: 0,
         withWebsite: 0,
-        withPhone: 0,
-        withEmail: 0
+        withPhone: 0
     };
     _turboInMemory.config = {};
     _turboInMemory.openTabs = new Set();
@@ -1022,8 +1044,30 @@ async function startTurboV3(config) {
         return { status: 'error', message: `Location not found: ${city}` };
     }
 
+    // M17-2 FIX (2026-08-19): 6.9 km (= GOOGLE_EFFECTIVE_RADIUS_KM 4 × √3,
+    // hex-packing minimum for Maps' ~4 km effective result radius) is the real
+    // minimum the grid can honor. Pre-fix, validation accepted spacing >= 5
+    // and generateGrid raised anything lower IN SILENCE — a user asking 5 km
+    // got 6.9 km cells with zero signal. Clamp HERE, visibly: console warn +
+    // area_search_warning broadcast (generic {message} shape already rendered
+    // by the modal banner and the sidepanel toast/Activity Feed).
+    // generateGrid keeps its own Math.max as defense-in-depth.
+    const effectiveSpacingKm = Math.max(spacingKm, GRID_OPTIMIZER.MIN_OPTIMAL_SPACING);
+    if (effectiveSpacingKm > spacingKm) {
+        console.warn(`[GRID_OPTIMIZER] Requested spacing ${spacingKm}km is below the effective minimum ${GRID_OPTIMIZER.MIN_OPTIMAL_SPACING}km (each Maps search covers ~${GRID_OPTIMIZER.GOOGLE_EFFECTIVE_RADIUS_KM}km) — using ${effectiveSpacingKm}km`);
+        chrome.runtime.sendMessage({
+            action: 'area_search_warning',
+            payload: {
+                type: 'spacing_clamped',
+                requestedKm: spacingKm,
+                effectiveKm: effectiveSpacingKm,
+                message: `Grid spacing ${spacingKm} km è sotto il minimo effettivo ${GRID_OPTIMIZER.MIN_OPTIMAL_SPACING} km (ogni ricerca Maps copre ~${GRID_OPTIMIZER.GOOGLE_EFFECTIVE_RADIUS_KM} km): la griglia userà ${effectiveSpacingKm} km`
+            }
+        }).catch(() => { });
+    }
+
     // Generate grid
-    const points = generateGrid(coords.lat, coords.lon, radiusKm, spacingKm);
+    const points = generateGrid(coords.lat, coords.lon, radiusKm, effectiveSpacingKm);
     console.log(`📐 ${points.length} grid points`);
 
     // Generate searches
@@ -1049,6 +1093,7 @@ async function startTurboV3(config) {
         isRunning: true,
         isPaused: false,
         currentBatch: 0,
+        batchesTrimmed: 0, // M17-3: fresh monotonic display offset per run
         totalBatches,
         completedSearches: 0,
         totalSearches: searches.length,
@@ -1936,10 +1981,24 @@ async function runTurboV3() {
 
             // S10: count cells whose 0-result page showed CAPTCHA markers.
             let captchaCells = 0;
+            // M15: count cells whose extraction NEVER ran/completed (tab
+            // crashed or closed, executeScript rejected, per-cell flow threw).
+            // Distinct from a legit-empty cell: these are NOT searched.
+            let crashedCells = 0;
 
             for (const { tab, search } of createdTabs) {
                 try {
                     const businesses = await extractEnhanced(tab.id);
+
+                    // M15: null = extraction never ran (crashed/closed tab).
+                    // Checked BEFORE the S10 zero-result audit so a crashed
+                    // cell is counted exactly once (never also audited as
+                    // captcha — checkForCaptcha on a dead tab returns false
+                    // and would misfile it as legitimately empty).
+                    if (businesses === null) {
+                        crashedCells++;
+                        continue;
+                    }
 
                     // S10: 0 extracted is ambiguous (legit empty cell vs
                     // CAPTCHA interstitial). Audit the still-open tab BEFORE
@@ -1984,6 +2043,13 @@ async function runTurboV3() {
                     }
                 } catch (e) {
                     console.error(`[EXTRACTION ERROR] Tab ${tab.id}:`, e.message);
+                    // M15: an exception anywhere in the per-cell flow (audit,
+                    // saveBatch, …) means this cell was NOT fully searched —
+                    // pre-fix it silently fell through into completedSearches
+                    // as a clean 0-result cell. Conservative: any businesses
+                    // already pushed stay in businessBatch and are flushed by
+                    // a later save (dedup absorbs a re-search of the cell).
+                    crashedCells++;
                 }
             }
 
@@ -2004,6 +2070,28 @@ async function runTurboV3() {
                         type: 'captcha_cells',
                         cells: captchaCells,
                         message: `CAPTCHA page detected in ${captchaCells} cell(s) — cells skipped, not counted as empty`
+                    }
+                }).catch(() => { });
+            }
+
+            // M15: crashed/errored cells are NOT searched — same Forensic #18
+            // counter and the same once-per-batch area_search_warning channel
+            // as the S10 captcha block above ({message} payload shape handled
+            // generically by both sidepanel.js and area-search-modal.js).
+            // completedSearches deliberately still advances by batch.length in
+            // the finally (S10 convention): progress totals stay intact and
+            // cellsNotSearched is the honesty overlay finishTurbo surfaces.
+            if (crashedCells > 0) {
+                TURBO_STATE.stats = {
+                    ...TURBO_STATE.stats,
+                    cellsNotSearched: (TURBO_STATE.stats.cellsNotSearched || 0) + crashedCells
+                };
+                chrome.runtime.sendMessage({
+                    action: 'area_search_warning',
+                    payload: {
+                        type: 'crashed_cells',
+                        cells: crashedCells,
+                        message: `Extraction failed in ${crashedCells} cell(s) (tab crashed/closed or extraction error) — cells marked not-searched, not counted as empty`
                     }
                 }).catch(() => { });
             }
@@ -2164,7 +2252,14 @@ async function runTurboV3() {
                 if (processedCount < TURBO_STATE.searches.length) {
                     // Only keep remaining searches, clear processed ones
                     TURBO_STATE.searches = TURBO_STATE.searches.slice(processedCount);
-                    TURBO_STATE.currentBatch = 0;  // Reset batch counter
+                    // M17-3 FIX (2026-08-19): currentBatch is BOTH the run-loop
+                    // cursor into `searches` and the value the progress UI shows.
+                    // Resetting the cursor made the batch counter jump BACKWARDS
+                    // every 5 batches (e.g. 5/20 → 0/15). Accumulate the trimmed
+                    // batches so broadcastProgress can keep the display monotonic
+                    // (cursor + batchesTrimmed). The cleanup itself is unchanged.
+                    TURBO_STATE.batchesTrimmed = (TURBO_STATE.batchesTrimmed || 0) + TURBO_STATE.currentBatch;
+                    TURBO_STATE.currentBatch = 0;  // Reset batch cursor (loop-internal)
                     TURBO_STATE.totalBatches = Math.ceil(TURBO_STATE.searches.length / parallelTabs);
                     console.log(`[MEMORY] 🧹 Cleared processed searches, ${TURBO_STATE.searches.length} remaining`);
                 }
@@ -2560,9 +2655,20 @@ async function extractEnhanced(tabId) {
             }
         });
 
-        return results?.[0]?.result || [];
+        // M15 (2026-08-18): the injected func ALWAYS returns an array, so a
+        // non-array result means the frame was destroyed mid-execution —
+        // that is "extraction never completed", not "zero businesses".
+        const extracted = results?.[0]?.result;
+        return Array.isArray(extracted) ? extracted : null;
     } catch (e) {
-        return [];
+        // M15: pre-fix this returned [] — a crashed/closed tab (executeScript
+        // rejects with "No tab with id …") was indistinguishable from a
+        // legitimately empty cell and the run finished "clean" with invisible
+        // coverage holes. NULL is the "cell NOT searched" sentinel; the
+        // extraction loop routes it into cellsNotSearched (Forensic #18).
+        // Sole caller is the Step-5 extraction loop in runTurboV3.
+        console.warn(`[EXTRACTION] Tab ${tabId} extraction failed (tab crashed/closed?): ${e.message}`);
+        return null;
     }
 }
 
@@ -3220,6 +3326,13 @@ function broadcastProgress() {
     const avgTime = current > 0 ? elapsed / current : 2000;
     const remaining = (total - current) * avgTime;
 
+    // M17-3 FIX (2026-08-19): the H-002 memory cleanup slices processed
+    // searches and resets the currentBatch CURSOR to 0. The display counters
+    // add back the trimmed batches so the UI batch number never regresses
+    // (and totalBatches stays the original run total — trims happen at exact
+    // batch boundaries, so remaining + trimmed == original).
+    const batchesTrimmed = TURBO_STATE.batchesTrimmed || 0;
+
     chrome.runtime.sendMessage({
         action: 'area_search_progress',
         payload: {
@@ -3228,8 +3341,8 @@ function broadcastProgress() {
             current,
             total,
             percent,
-            currentBatch: TURBO_STATE.currentBatch,
-            totalBatches: TURBO_STATE.totalBatches,
+            currentBatch: TURBO_STATE.currentBatch + batchesTrimmed,
+            totalBatches: TURBO_STATE.totalBatches + batchesTrimmed,
             elapsed: formatDuration(elapsed),
             remaining: formatDuration(remaining),
             stats: TURBO_STATE.stats,
@@ -3254,6 +3367,16 @@ function broadcastProgress() {
 let _finishReason = null;
 let _onRunFinished = null;
 function setOnRunFinished(cb) { _onRunFinished = cb; }
+
+// R5-F5 (2026-08-19, review M9-M11): hook simmetrico, registrato da
+// background/index.js per RI-ARMARE il keepalive quando il run loop riparte
+// dopo un'eviction (respawn in _restoreTurboState().then — vedi lì). Senza,
+// il respawn contava solo sull'alarm persistito pre-eviction, che la finestra
+// F8 (self-heal del tick con `_initialized=true` mentre questo restore —
+// fire-and-forget, non sequenziato con initialize() — è ancora pendente) può
+// aver appena cancellato.
+let _onRunResumed = null;
+function setOnRunResumed(cb) { _onRunResumed = cb; }
 
 async function finishTurbo() {
     TURBO_STATE.isRunning = false;
@@ -3736,7 +3859,7 @@ Add to background/index.js:
 // EXPORTS
 // =====================================================
 
-export { startTurboV3, pauseTurbo, resumeTurbo, stopTurbo, getTurboStatus, setSaveHandler, setOnRunFinished };
+export { startTurboV3, pauseTurbo, resumeTurbo, stopTurbo, getTurboStatus, setSaveHandler, setOnRunFinished, setOnRunResumed };
 // v9.11: Exported for unit tests in tests/area_search_detail_drain.test.js.
 // These are NOT part of the public API — internal helpers used by runTurboV3.
 export { _wakeObserversInTabs, _waitForDetailFetcherIdle, _collectDetailFetcherStats };
@@ -3756,4 +3879,8 @@ export { selectGeocodeResult };
 // S10 (2026-08-18): exported for tests/run-s10-area-search-captcha-cell-audit-node.mjs.
 // Internal 0-result-cell CAPTCHA audit — NOT public API.
 export { _auditZeroResultCell };
-export default { start: startTurboV3, pause: pauseTurbo, resume: resumeTurbo, stop: stopTurbo, status: getTurboStatus, setSaveHandler, setOnRunFinished };
+// M15 (2026-08-18): exported for tests/run-m15-crashed-cell-accounting-node.mjs.
+// Internal Step-5 extractor — NOT public API. Failure contract: null = cell
+// NOT searched (tab crashed/closed, frame destroyed); [] = legit empty cell.
+export { extractEnhanced };
+export default { start: startTurboV3, pause: pauseTurbo, resume: resumeTurbo, stop: stopTurbo, status: getTurboStatus, setSaveHandler, setOnRunFinished, setOnRunResumed };

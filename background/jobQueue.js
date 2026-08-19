@@ -114,7 +114,10 @@ export class JobQueue {
             processed: 0,
             succeeded: 0,
             failed: 0,
-            retried: 0
+            retried: 0,
+            // M12: duplicate enqueues rejected by the canonicalUrl dedup
+            // index (skipped, not errors).
+            dedupSkipped: 0
         };
 
         // Callbacks
@@ -158,6 +161,29 @@ export class JobQueue {
         // them; clear() uses this set to scrub those entries and prevent
         // post-clear resurrection (BG-12 phantom-job class).
         this._backoffJobIds = new Set();
+
+        // R2-F1 (review M11, 2026-08-18): ids whose backoff TIMER was killed
+        // by stop() (BGW-H2 clears all pending timers) but whose S7 ledger
+        // entry deliberately survives for boot-time recovery. Kept separate
+        // from _backoffJobIds so that set only ever contains LIVE backoff
+        // windows (getStatus().backoff feeds the keepalive derivation in
+        // index.js — a stale id there would hold the 30s alarm forever).
+        // clear() scrubs the ledger of BOTH sets (S7/BG-12: explicit clear =
+        // no phantom resurrection at next boot, even after a stop()+clear()).
+        this._orphanedBackoffIds = new Set();
+
+        // M12 FIX (2026-08-18): dedup index canonicalUrl → jobId for every
+        // typed job whose params carry a canonicalUrl, spanning queue +
+        // activeJobs + retry-backoff windows. The QUEUE rejects duplicate
+        // enqueues (S6 only closed the concurrent TOCTOU on the
+        // startEmailScraping entry point; sequential starts, api_* starts and
+        // retry-failed overlapping a running start still enqueued N jobs for
+        // the same business). Kept coherent on every exit path: _executeJob
+        // finally (success / permanent failure / invalid-fn), domain-budget
+        // drop in _processQueue, clear(), stop() (killed backoff timers).
+        // In-memory only: after SW eviction it is rebuilt by loadQueue() /
+        // _recoverOrphanedActiveJobs() via _indexJob().
+        this._canonicalUrlIndex = new Map();
 
         // M2-RACE1 FIX: Cancellation token for addJobsInBatches
         this._cancellationRequested = false;
@@ -304,6 +330,23 @@ export class JobQueue {
 
         // BGW-H2 FIX: Clear all pending timers
         this._clearPendingTimers();
+
+        // M12: the cleared timers above orphan any backoff job for THIS SW
+        // life (its S7 ledger entry survives for boot-time recovery — made
+        // harmless by the M13 already-scraped guard). Free their dedup keys
+        // so the business stays enqueueable in-session. Snapshot BEFORE the
+        // active-jobs drain: a job entering backoff during the drain gets a
+        // live (un-cleared) timer and must keep its claim.
+        for (const backoffJobId of this._backoffJobIds) {
+            this._unindexJobById(backoffJobId);
+            // R2-F1: the timer is dead — the backoff window is no longer
+            // LIVE. Move the id to the orphan set: getStatus().backoff must
+            // drop to 0 (or the keepalive derivation in index.js would hold
+            // the alarm forever on a run that can no longer progress), while
+            // a later clear() must still be able to scrub the ledger entry.
+            this._orphanedBackoffIds.add(backoffJobId);
+        }
+        this._backoffJobIds.clear();
 
         // Wait for active jobs to complete
         while (this.activeJobs.size > 0) {
@@ -465,15 +508,24 @@ export class JobQueue {
         // still alive until re-dispatch). Active in-flight jobs keep their
         // entries — clear() does not cancel those. Fire-and-forget: the
         // writes are mutex-serialized and errors are logged inside.
-        const s7IdsToScrub = new Set(this._backoffJobIds);
+        // R2-F1: also scrub the ledger of backoff jobs whose timer a previous
+        // stop() already killed (moved to _orphanedBackoffIds there) — a
+        // stop()+clear() sequence (factory reset, index.js clear_data path)
+        // must not leave resurrectable entries behind.
+        const s7IdsToScrub = new Set([...this._backoffJobIds, ...this._orphanedBackoffIds]);
         for (const j of this.queue) {
             if (j && j.persistable && j.type) s7IdsToScrub.add(j.id);
         }
         this._backoffJobIds.clear();
+        this._orphanedBackoffIds.clear();
         for (const id of s7IdsToScrub) {
             this._unpersistActiveJob(id);
         }
         this.queue = [];
+        // M12: explicit clear wipes the dedup index — every canonicalUrl is
+        // immediately enqueueable again. In-flight active jobs release their
+        // (now unmapped) key via the id-guarded _unindexJob in finally.
+        this._canonicalUrlIndex.clear();
         this._jobsAddedDuringProcessing = false; // M4-BUG1: Reset dirty flag on clear
         logger.info('Job queue cleared (queue + pending timers)');
     }
@@ -507,6 +559,14 @@ export class JobQueue {
             pending: this.queue.length,
             queued: this.queue.length, // Alias for tests
             active: this.activeJobs.size,
+            // R2-F1 (review M11, 2026-08-18): jobs inside a LIVE retry-backoff
+            // window are neither pending nor active (they exist only in the
+            // retry setTimeout closure + S7 ledger). Exposed so the keepalive
+            // derivation (index.js _isAnyFlowObservablyActive) can count them
+            // as activity — the timer dies with a SW eviction, and without
+            // the alarm there is no next boot to recover the ledger from.
+            // Additive field: all consumers do property reads only.
+            backoff: this._backoffJobIds.size,
             failed: this.failedJobs.length,
             isProcessing: this.isProcessing,
             isPaused: this.isPaused,
@@ -661,6 +721,11 @@ export class JobQueue {
                             reason: 'domain_rate_limited'
                         });
                         this._enforceFailedJobsCap();
+                        // M12: this job exits WITHOUT passing through
+                        // _executeJob's finally — free its dedup key here or
+                        // the business would never be enqueueable again in
+                        // this SW life.
+                        this._unindexJob(job);
                         logger.warn(`[QUEUE] Domain ${job.domain} exceeded retry budget, skipping job ${job.id}`);
                         continue;
                     }
@@ -762,6 +827,16 @@ export class JobQueue {
             logger.debug(`Job ${job.id} completed successfully`);
 
             // PHASE 2: Record success for AutoScaler adaptive concurrency
+            // R5-5a NOTA CONSCIA (2026-08-19, peer review): anche un job
+            // robots-disallowed arriva qui (post-R4 risolve normalmente —
+            // tassonomia S8 PERMANENTE-LEGITTIMO) e viene contato success.
+            // Deliberato: il success-rate dell'AutoScaler misura la salute
+            // dell'INFRASTRUTTURA (possiamo sostenere più concorrenza?), e un
+            // disallow è un fetch di robots.txt riuscito + zero segnali di
+            // stress (niente 429/timeout/blocchi) — non è un guasto. Escluderlo
+            // richiederebbe di ispezionare il result shape di esv2 qui
+            // (accoppiamento) per correggere un bias di costo trascurabile;
+            // il breaker di dominio resta comunque NEUTRO (vedi esv2 R4).
             this.autoScaler.recordResult(true, { domain: job.domain });
 
             if (this.onJobComplete) {
@@ -904,8 +979,14 @@ export class JobQueue {
             // as orphaned on next loadQueue (post-eviction).
             // S7 FIX: EXCEPT while a retry backoff is pending — the ledger
             // entry is then the only eviction-safe reference to the job.
+            // M12: same condition frees the canonicalUrl dedup key — the job
+            // left the system (success, permanent failure or invalid-fn
+            // early-exit), so the business becomes enqueueable again (e.g.
+            // Retry Failed). During a backoff window the key stays claimed:
+            // the timer re-add is the SAME job, not a duplicate.
             if (!retryScheduled) {
                 this._unpersistActiveJob(job.id);
+                this._unindexJob(job);
             }
 
             // PHASE 2 FIX: Trigger AutoScaler evaluation after each job
@@ -1134,6 +1215,63 @@ export class JobQueue {
         return `job_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // M12 FIX (2026-08-18): canonicalUrl dedup index helpers.
+    // Jobs WITHOUT a canonicalUrl (closure jobs, generic typed jobs) are never
+    // deduped — the key is the IndexedDB business key, absent elsewhere.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Extract the dedup key from job params. Non-string / empty → null (no dedup).
+     * @private
+     */
+    _canonicalKeyOfParams(params) {
+        const k = params?.canonicalUrl;
+        return (typeof k === 'string' && k.length > 0) ? k : null;
+    }
+
+    /**
+     * Claim the job's canonicalUrl in the dedup index.
+     * Returns false when ANOTHER job (different id) already holds the key —
+     * caller must treat the job as a duplicate and skip it. Used by
+     * addTypedJob and by the rehydration paths (loadQueue /
+     * _recoverOrphanedActiveJobs / retryFailedJobs), so a pre-fix snapshot
+     * containing duplicates is deduplicated at restore time too.
+     * @private
+     */
+    _indexJob(job) {
+        const key = this._canonicalKeyOfParams(job?.params);
+        if (!key) return true; // not subject to dedup
+        const existing = this._canonicalUrlIndex.get(key);
+        if (existing !== undefined && existing !== job.id) return false;
+        this._canonicalUrlIndex.set(key, job.id);
+        return true;
+    }
+
+    /**
+     * Release the job's canonicalUrl — only if the index still maps to THIS
+     * job's id (guards against deleting a newer legitimate claim).
+     * @private
+     */
+    _unindexJob(job) {
+        const key = this._canonicalKeyOfParams(job?.params);
+        if (!key) return;
+        if (this._canonicalUrlIndex.get(key) === job.id) {
+            this._canonicalUrlIndex.delete(key);
+        }
+    }
+
+    /**
+     * Release by job id (used where only the id is at hand, e.g. the
+     * backoff-id set in stop()). Linear scan — the index is queue-sized.
+     * @private
+     */
+    _unindexJobById(jobId) {
+        for (const [key, id] of this._canonicalUrlIndex) {
+            if (id === jobId) { this._canonicalUrlIndex.delete(key); return; }
+        }
+    }
+
     /**
      * Get failed jobs
      */
@@ -1148,12 +1286,21 @@ export class JobQueue {
         const failed = [...this.failedJobs];
         this.failedJobs = [];
 
+        let requeued = 0;
         failed.forEach(job => {
             job.retries = 0; // Reset retry count
+            // M12: re-claim the canonicalUrl; skip if another live job
+            // already holds it (duplicate would re-enter the queue).
+            if (!this._indexJob(job)) {
+                this.stats.dedupSkipped++;
+                logger.info(`[JobQueue] ⏭️ Retry re-queue skipped duplicate canonicalUrl job ${job.id} (M12)`);
+                return;
+            }
             this.queue.push(job);
+            requeued++;
         });
 
-        logger.info(`Re-queued ${failed.length} failed jobs`);
+        logger.info(`Re-queued ${requeued} failed jobs`);
 
         if (!this.isProcessing) {
             this.start();
@@ -1231,6 +1378,20 @@ export class JobQueue {
             throw new Error(`Unknown job type: ${type}. Register it first with registerJobType()`);
         }
 
+        // M12 FIX (2026-08-18): the queue rejects canonicalUrl duplicates.
+        // A job for this business is already tracked (queue, active or
+        // retry-backoff window) → the enqueue is a logged no-op counted as
+        // skipped (not an error), returning the existing job's id. Synchronous
+        // check — preserves the S6 invariant (first batch enqueued in the
+        // same tick as the start critical section).
+        const dedupKey = this._canonicalKeyOfParams(params);
+        if (dedupKey && this._canonicalUrlIndex.has(dedupKey)) {
+            const existingId = this._canonicalUrlIndex.get(dedupKey);
+            this.stats.dedupSkipped++;
+            logger.info(`[JobQueue] ⏭️ Duplicate enqueue skipped (M12): canonicalUrl already tracked by job ${existingId} — ${dedupKey}`);
+            return existingId;
+        }
+
         const job = {
             id: this._generateJobId(),
             fn: factory(params),
@@ -1256,6 +1417,9 @@ export class JobQueue {
                 // Ignore URL parsing errors
             }
         }
+
+        // M12: claim the canonicalUrl before the job becomes visible.
+        if (dedupKey) this._canonicalUrlIndex.set(dedupKey, job.id);
 
         this.queue.push(job);
         this.queue.sort((a, b) => b.priority - a.priority);
@@ -1451,6 +1615,10 @@ export class JobQueue {
                     domain: j.domain || null,
                     persistable: true
                 };
+                // M12: keep the dedup index coherent on recovery too — a
+                // ledger entry whose canonicalUrl is already claimed by a
+                // restored/queued job (different id) is a duplicate.
+                if (!this._indexJob(reconstructed)) { dropped++; continue; }
                 this.queue.push(reconstructed);
                 recovered++;
             }
@@ -1618,6 +1786,13 @@ export class JobQueue {
                 // Add to queue (avoiding duplicates)
                 const existing = this.queue.find(j => j.id === job.id);
                 if (!existing) {
+                    // M12: rebuild the canonicalUrl dedup index on restore.
+                    // A pre-fix snapshot may itself contain duplicates
+                    // (different ids, same canonicalUrl) — drop them here.
+                    if (!this._indexJob(job)) {
+                        logger.info(`[JobQueue] ⏭️ Restore skipped duplicate canonicalUrl job ${job.id} (M12)`);
+                        continue;
+                    }
                     this.queue.push(job);
                     loaded++;
                 }

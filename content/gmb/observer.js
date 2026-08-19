@@ -58,6 +58,19 @@ export class DOMObserver {
     static MAX_PROCESSING_QUEUE_SIZE = 50000;
     // BLOCK-3 FIX (CRIT-006): Max time (ms) to wait for IntersectionObserver before cleanup
     static PENDING_ELEMENT_TIMEOUT = 60000; // 60 seconds
+    // M6 FIX (2026-08-18): bounded retry budget for the R-DETAIL-FETCH
+    // enrichment. A card whose detail-fetch fails TRANSIENTLY (timeout,
+    // kill-switch cooldown, 403/429/5xx rate-limit, network error) stays
+    // eligible for a retry on a later trigger, but never fires more than
+    // this many network requests — an unrecoverable card must not loop.
+    static MAX_DETAIL_FETCH_ATTEMPTS = 3;
+    // R3-C3a FIX (2026-08-18): minimum spacing between pipeline-driven
+    // re-fires of the SAME retryable card. The discovery gates (see
+    // _isDetailFetchRetryable) now let retryable URLs re-enter the pipeline
+    // on every Maps re-render — without a cooldown a churning DOM would
+    // re-extract + re-fire a failing card on every mutation batch. Applies
+    // ONLY to the gates; direct _maybeFireDetailFetch calls are not delayed.
+    static DETAIL_FETCH_RETRY_COOLDOWN_MS = 30000;
 
     constructor(config, onNewBusiness) {
         this.config = config;
@@ -245,6 +258,18 @@ export class DOMObserver {
                     }
                     this._stateBusinessMapSize = this._stateBusinessMap.size;
                 }
+                // R3-C1b FIX (2026-08-18): consume the watcher's drift ledger.
+                // M2 shipped `payload.drift` (canaryFailures + fallbackRecoveries
+                // + recordsChecked) on this channel, but this listener read only
+                // `map`/`businesses` — the telemetry had moved from one void
+                // (MAIN-world console) to another (an unread payload field).
+                // Now it is cached and exposed via getStats() (programmatically
+                // observable — no console needed) and growth is surfaced through
+                // the extension logger. See _ingestDriftTelemetry for why it is
+                // deliberately NOT injected into the M8 selector_telemetry batch.
+                if (payload.drift && typeof payload.drift === 'object' && !Array.isArray(payload.drift)) {
+                    this._ingestDriftTelemetry(payload.drift);
+                }
                 // Visible diagnostic (info level) so users can confirm in
                 // DevTools console that state extraction is wired up.
                 logger.info(`[R-STATE] map updated: ${this._stateCidPhoneMapSize} phones, ${this._stateBusinessMapSize} full businesses`);
@@ -276,20 +301,19 @@ export class DOMObserver {
                 }, location.origin);
             }
 
-            // B2-1 FIX (2026-05-10): periodic re-arm of the watcher poll.
-            // The MAIN-world watcher (maps-state-watcher.js:115,542) caps
-            // polling at MAX_POLL_MS = 5 min. After 5 min of polling, the
-            // setInterval is cleared and the watcher goes silent — meaning
-            // any new business cards loaded via SPA scroll/navigation are
-            // NOT captured into _stateBusinessMap. The watcher only re-arms
-            // when it receives a `gmp:state-map-request` postMessage. Pre-
-            // fix that request was sent ONCE at observer start, so 5 min
-            // later the state map went stale.
-            //
-            // Fix: send the request every 4 minutes (50 % below MAX_POLL_MS)
-            // so `pollStartedAt` is always reset before the watcher times
-            // out. The watcher's lastMapJson dedupe ensures repeated
-            // requests with no new data don't post duplicate maps.
+            // B2-1 FIX (2026-05-10), re-scoped by M5 + R3-C4 (2026-08-18):
+            // periodic gmp:state-map-request to the MAIN-world watcher.
+            // HISTORY: the watcher used to self-stop its poll 5 minutes after
+            // the last request, so this 4-minute timer was a liveness
+            // keepalive (its original B2-1 purpose). M5 removed that
+            // self-shutoff — the watcher's poll now runs for the tab's
+            // lifetime — so the keepalive role is gone. The timer is KEPT
+            // because each request still forces one fresh republish of the
+            // full current snapshot (the watcher sets lastPublishedVersion =
+            // -1; S1 O(1) version-counter change detection): that heals the
+            // ISOLATED-side caches after losses this world cannot detect
+            // (a dropped gmp:state-map message, an observer re-instantiated
+            // mid-session), at the cost of one idempotent re-post per 4 min.
             //
             // Defensive: null-check before assigning to avoid leaking timers
             // if _setupStateMapListener is somehow called twice. Inside the
@@ -407,6 +431,85 @@ export class DOMObserver {
     }
 
     /**
+     * R3-C1b (2026-08-18): ingest the JSPB drift ledger shipped by the
+     * MAIN-world watcher on `gmp:state-map` (`payload.drift`). The ledger is
+     * the early-warning signal of a live Google index migration
+     * (fallbackRecoveries) and of dropped implausible values (canaryFailures);
+     * post R3-C1a its counters are per-record EVENTS, so the numbers are
+     * quantitatively meaningful.
+     *
+     * Consumer design (the cheapest point that makes the telemetry observable
+     * without opening any console):
+     *   - cached on `_driftTelemetry` and exposed via getStats() — anything
+     *     that polls observer stats (today the stop() flow in
+     *     content/gmb/index.js, tomorrow any SW/sidepanel status poll) sees it;
+     *   - growth logged via logger.warn, rate-limited to 1/min.
+     * Deliberately NOT injected into the M8 `selector_telemetry` batch even
+     * though its batchId idempotency is attractive: every snapshot entry's
+     * hits/attempts are added to Statistics.selectorTotalHits/TotalAttempts —
+     * the denominators of the selector-decay canary
+     * (getSelectorDecayReport.classShare) — so drift pseudo-entries would
+     * silently dilute an unrelated metric, and teaching the SW sink to filter
+     * them is outside this file's boundary. The drift ledger is CUMULATIVE
+     * state (idempotent to re-deliver), so the lossy postMessage channel needs
+     * no ack protocol: the next gmp:state-map re-ships the full counters.
+     *
+     * The bridge is page-forgeable (same threat model as `payload.businesses`,
+     * see CT-4/BR-3): shapes are validated, non-finite counter values dropped,
+     * malformed payloads ignored without clobbering the last good snapshot.
+     * @private
+     */
+    _ingestDriftTelemetry(drift) {
+        try {
+            const cleanCounters = (o) => {
+                const out = {};
+                if (!o || typeof o !== 'object' || Array.isArray(o)) return out;
+                for (const [k, v] of Object.entries(o)) {
+                    if (typeof k === 'string' && Number.isFinite(v) && v >= 0) out[k] = v;
+                }
+                return out;
+            };
+            const canaryFailures = cleanCounters(drift.canaryFailures);
+            const fallbackRecoveries = cleanCounters(drift.fallbackRecoveries);
+            // Entirely-invalid ledger (no valid counter in either bucket AND a
+            // non-numeric recordsChecked) ⇒ forged/garbled envelope: ignore it
+            // rather than clobber the last good snapshot. A legitimate
+            // zero-drift ledger always carries a finite recordsChecked.
+            if (Object.keys(canaryFailures).length === 0
+                && Object.keys(fallbackRecoveries).length === 0
+                && !Number.isFinite(drift.recordsChecked)) {
+                return;
+            }
+            const sum = (o) => Object.values(o).reduce((a, v) => a + v, 0);
+            const total = sum(canaryFailures) + sum(fallbackRecoveries);
+            const prevTotal = this._driftTelemetry ? this._driftTelemetry.total : 0;
+            this._driftTelemetry = {
+                canaryFailures,
+                fallbackRecoveries,
+                recordsChecked: Number.isFinite(drift.recordsChecked) ? drift.recordsChecked : 0,
+                total,
+                updatedAt: Date.now()
+            };
+            if (total > prevTotal) {
+                const now = Date.now();
+                if (!this._lastDriftWarnAt || now - this._lastDriftWarnAt > 60000) {
+                    this._lastDriftWarnAt = now;
+                    logger.warn(
+                        `[R-STATE] JSPB drift ledger grew to ${total} event(s) — ` +
+                        `canaryFailures=${JSON.stringify(canaryFailures)} ` +
+                        `fallbackRecoveries=${JSON.stringify(fallbackRecoveries)} ` +
+                        `(records checked: ${this._driftTelemetry.recordsChecked}). ` +
+                        `A rising fallbackRecoveries means Google is migrating a JSPB index — ` +
+                        `promote the recovering alternate path before exports corrupt.`
+                    );
+                }
+            }
+        } catch (err) {
+            logger.debug(`[R-STATE] drift ingest skipped: ${err?.message}`);
+        }
+    }
+
+    /**
      * R-STATE-FULL: lookup the FULL business field record by URL.
      * Returns the catalog object (title, ratingDecimal, reviewsCount,
      * categoryCodes, priceHistogram, hoursWeekly, serviceOptions, owner*,
@@ -521,17 +624,72 @@ export class DOMObserver {
                 || lsEnabled
                 || this._detailFetchFlagFromMain === true
                 || (typeof window !== 'undefined' && window.__gmpEnableDetailFetch === true);
-            if (!flagOn) return;
+            if (!flagOn) {
+                // R5-1 FIX (2026-08-19, peer review): se il flag viene SPENTO
+                // mentre questo URL ha un marker retry APERTO, stampare
+                // lastAttemptAt qui — senza questo, il cooldown di
+                // _isDetailFetchRetryable non riparte mai e il retry-pass
+                // R3-C3a ri-estrae la card ad OGNI mutation batch finché
+                // stop/reset (CPU churn illimitato a flag spento). Il bump
+                // bounded (1 estrazione/URL per cooldown) è preferito alla
+                // chiusura del marker: done=true perderebbe il retry budget
+                // alla riaccensione del flag. attempts NON viene toccato —
+                // nessuna richiesta è partita.
+                const m = business && business.googleMapsUrl && this._detailFetchAttempted
+                    ? this._detailFetchAttempted.get(business.googleMapsUrl)
+                    : null;
+                if (m && !m.done && !m.inflight) m.lastAttemptAt = Date.now();
+                return;
+            }
             if (!business || !business.googleMapsUrl) return;
-            if (business.phone) return;       // common path, no log noise
+            if (business.phone) {
+                // Common path, no log noise. R3-C3a (2026-08-18): if this URL
+                // carries an OPEN retry marker (an earlier fetch attempt means
+                // the record already shipped to the SW without a phone) and the
+                // phone has now been recovered by another path (DOM/state-map
+                // caught up on a re-encounter), ship it once as a hole-filling
+                // enrichment and close the marker — otherwise the SW record
+                // stays phone-less while the retry loop goes quiet.
+                const m = this._detailFetchAttempted && this._detailFetchAttempted.get(business.googleMapsUrl);
+                if (m && !m.done && !m.inflight) {
+                    m.done = true;
+                    try {
+                        chrome.runtime.sendMessage({
+                            action: 'business_enrichment',
+                            payload: { googleMapsUrl: business.googleMapsUrl, fields: { phone: business.phone } },
+                        });
+                    } catch (err) {
+                        logger.debug('[R-DETAIL-FETCH] recovered-phone enrichment send failed:', err?.message);
+                    }
+                }
+                return;
+            }
             const ids = this._idsFromUrl(business.googleMapsUrl);
             if (!ids) {
                 logger.debug(`[R-DETAIL-FETCH] skip ${business.title?.slice(0,40)}: href ids unparseable`);
                 return;
             }
-            if (!this._detailFetchAttempted) this._detailFetchAttempted = new Set();
-            if (this._detailFetchAttempted.has(business.googleMapsUrl)) return;
-            this._detailFetchAttempted.add(business.googleMapsUrl);
+            // M6 FIX (2026-08-18): `_detailFetchAttempted` upgraded Set → Map
+            // (url → { attempts, done, inflight }). Pre-fix the URL was marked
+            // BEFORE/independently of the outcome, and only `error === 'timeout'`
+            // dropped the marker (Forensic #16) — every other transient failure
+            // (kill-switch cooldown M1, 429/503, network error) left the card
+            // PERMANENTLY unenrichable for the session. Now the marker becomes
+            // permanent only on a definitive outcome (success, real negative);
+            // transient failures keep the card eligible within a bounded budget
+            // of MAX_DETAIL_FETCH_ATTEMPTS fired requests.
+            if (!this._detailFetchAttempted) this._detailFetchAttempted = new Map();
+            const priorMarker = this._detailFetchAttempted.get(business.googleMapsUrl);
+            if (priorMarker && (priorMarker.done
+                || priorMarker.inflight
+                || priorMarker.attempts >= DOMObserver.MAX_DETAIL_FETCH_ATTEMPTS)) return;
+            const marker = priorMarker || { attempts: 0, done: false, inflight: false, lastAttemptAt: 0 };
+            marker.attempts += 1;
+            marker.inflight = true;
+            // R3-C3a: timestamp feeds the pipeline-gate cooldown
+            // (_isDetailFetchRetryable); direct calls are unaffected.
+            marker.lastAttemptAt = Date.now();
+            this._detailFetchAttempted.set(business.googleMapsUrl, marker);
 
             logger.info(`[R-DETAIL-FETCH] FIRE for ${business.title?.slice(0,40)} (cid=${ids.cid.slice(0,20)}...)`);
 
@@ -539,20 +697,35 @@ export class DOMObserver {
             // and backoff inside detail-fetcher.js handle systemic failures;
             // single-card failures should not noise the console.
             this.fetchDetailViaNetwork(business.googleMapsUrl).then((result) => {
+                marker.inflight = false;
                 if (!result || !result.ok || !result.fields) {
                     logger.info(`[R-DETAIL-FETCH] no-result for ${business.title?.slice(0,40)}: ok=${result?.ok} status=${result?.status} err=${result?.error}`);
-                    // Forensic #16: a timeout means the fetcher never delivered
-                    // (MAIN scripts not installed, crashed, or queue too deep) —
-                    // NOT a confirmed negative. Drop the attempted-marker so a
-                    // later R-DETAIL trigger (revisit / re-scroll) can retry,
-                    // instead of abandoning the URL forever. A genuine negative
-                    // (ok:false WITH a real status) stays marked — retrying it
-                    // would only repeat the same miss.
-                    if (result?.error === 'timeout' && this._detailFetchAttempted) {
-                        this._detailFetchAttempted.delete(business.googleMapsUrl);
+                    // M6 FIX (2026-08-18, supersedes the Forensic #16 timeout-
+                    // only marker drop while preserving its intent): classify
+                    // the failure. Definitive negative (a real non-rate-limit
+                    // HTTP status, invalid_payload) ⇒ permanent marker —
+                    // retrying would only repeat the same miss. Anything
+                    // transient (timeout, kill-switch cooldown, 429/503, soft
+                    // rate-limit body, network error, no reply) keeps the card
+                    // eligible for a later trigger, bounded by
+                    // MAX_DETAIL_FETCH_ATTEMPTS.
+                    if (this._isPermanentDetailFailure(result)) {
+                        marker.done = true;
+                    } else if (result && (result.error === 'kill_switch_tripped'
+                        || result.error === 'feature_disabled')) {
+                        // M1 coherence: a refusal at the gate consumed ZERO
+                        // network — don't burn an attempt, so cards refused
+                        // during a kill-switch outage keep their full retry
+                        // budget after the half-open recovery. Loop-safety:
+                        // refusals are answered instantly without fetching,
+                        // and re-fires only happen on user-driven rediscovery
+                        // triggers, so an un-recovered switch costs nothing.
+                        marker.attempts = Math.max(0, marker.attempts - 1);
                     }
                     return;
                 }
+                // Definitive outcome: the fetcher answered with fields.
+                marker.done = true;
                 const fields = {};
                 if (result.fields.phone)   fields.phone   = result.fields.phone;
                 if (result.fields.website) fields.website = result.fields.website;
@@ -596,10 +769,82 @@ export class DOMObserver {
                 } catch (err) {
                     logger.debug('[R-DETAIL-FETCH] sendMessage failed:', err?.message);
                 }
-            }).catch(() => { /* best-effort */ });
+            }).catch(() => {
+                // fetchDetailViaNetwork never rejects by contract; defensive
+                // only. Release the in-flight slot so the card isn't wedged.
+                marker.inflight = false;
+            });
         } catch (err) {
             logger.debug('[R-DETAIL-FETCH] fire skipped:', err?.message);
         }
+    }
+
+    /**
+     * M6 FIX (2026-08-18): classify a detail-fetch result as a DEFINITIVE
+     * negative (permanent marker — never re-fired) vs a transient failure
+     * (card stays retryable within MAX_DETAIL_FETCH_ATTEMPTS).
+     *
+     * Vocabulary verified against detail-fetcher.js response emission:
+     *   - ok:true                      ⇒ definitive (handled by the caller)
+     *   - error 'invalid_payload'      ⇒ deterministic SEC-01 reject: same
+     *                                     payload ⇒ same refusal ⇒ permanent
+     *   - status 429 / 403             ⇒ rate-limit / challenge ⇒ transient.
+     *                                     R3-C3b (2026-08-18): 403 from Google
+     *                                     is typically rate-limit/anti-bot
+     *                                     challenge state, not a per-place
+     *                                     verdict — pre-fix it was permanent.
+     *   - status 5xx (500/502/503/504…) ⇒ server-side ⇒ transient by
+     *                                     definition (R3-C3b: pre-fix only 503
+     *                                     was; 500/502/504 were permanent).
+     *   - status 200 with ok:false     ⇒ soft rate-limit / CAPTCHA body
+     *                                     ('non_json_body') ⇒ transient
+     *   - any other real HTTP status   ⇒ deterministic 4xx negative (400,
+     *                                     404, 410, …) ⇒ permanent (Forensic
+     *                                     #16 rule: retrying repeats the miss)
+     *   - no status (timeout, kill_switch_tripped, feature_disabled,
+     *     network exception, missing reply) ⇒ transient
+     * The MAX_DETAIL_FETCH_ATTEMPTS budget (3) remains the loop bound for
+     * every transient class.
+     * @private
+     */
+    _isPermanentDetailFailure(result) {
+        if (!result) return false;                       // no reply ⇒ transient
+        if (result.ok) return true;                      // definitive outcome
+        if (result.error === 'invalid_payload') return true;
+        if (typeof result.status !== 'number' || !Number.isFinite(result.status)) return false;
+        if (result.status === 200) return false;         // soft rate-limit body
+        if (result.status === 429 || result.status === 403) return false; // rate-limit / challenge
+        if (result.status >= 500) return false;          // 5xx ⇒ transient (R3-C3b)
+        return true;                                     // deterministic 4xx negative (400, 404…)
+    }
+
+    /**
+     * R3-C3a FIX (2026-08-18): is `url` a card whose detail-fetch is in a
+     * RETRYABLE state? Pre-fix the M6 bounded retry was unreachable in the
+     * real pipeline: every trigger path (checkForBusinesses ×2,
+     * handleIntersection, processQueue, forceCollectAll) re-passed the
+     * `processedUrls` LRU gate, which blocks a once-seen URL for the whole
+     * session — only the tests, calling _maybeFireDetailFetch directly, ever
+     * exercised the retry budget. All four gates now let a URL back through
+     * when this predicate holds; the retry pass re-extracts and re-fires the
+     * fetch but does NOT re-emit onNewBusiness (no duplicate business_batch —
+     * the SW already holds the record; enrichment merges fill its holes).
+     *
+     * Retryable ⇔ a marker exists (i.e. at least one fire was attempted, so
+     * the enrichment is known-missing) AND it is not done, not in flight, has
+     * budget left, and the per-URL cooldown has elapsed (churn bound: Maps
+     * re-renders cards on every mutation batch; without the cooldown a
+     * transiently-failing card would re-extract + re-fire continuously).
+     * @private
+     */
+    _isDetailFetchRetryable(url) {
+        if (!this._detailFetchAttempted || !url) return false;
+        const m = this._detailFetchAttempted.get(url);
+        if (!m || m.done || m.inflight) return false;
+        if (m.attempts >= DOMObserver.MAX_DETAIL_FETCH_ATTEMPTS) return false;
+        if (m.lastAttemptAt
+            && Date.now() - m.lastAttemptAt < DOMObserver.DETAIL_FETCH_RETRY_COOLDOWN_MS) return false;
+        return true;
     }
 
     // Forensic #16 (2026-06-11): default raised 12s → 40s to cover the
@@ -620,9 +865,28 @@ export class DOMObserver {
             if (!ids) { resolve({ ok: false, error: 'href_missing_ids' }); return; }
             const id = `gmp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
             const handler = (event) => {
-                if (event.source !== window) return;
+                // M7 FIX (2026-08-18): align with the state-map listener (CT-4).
+                // Pre-fix this handler used `event.source !== window` — the very
+                // identity check the comment in _setupStateMapListener declares
+                // unreliable across the MV3 world boundary — and validated
+                // neither origin nor response shape. Strict same-origin filter
+                // + shape validation instead.
+                // THREAT-MODEL HONESTY: the response arrives from the MAIN
+                // world via postMessage, which any same-origin page script can
+                // forge. This filter cannot authenticate the fetcher — it only
+                // blocks cross-origin frames and keeps malformed/dirty payloads
+                // out of the enrichment pipeline.
+                if (event.origin !== location.origin) return;
                 const data = event.data;
                 if (!data || data.type !== 'gmp:detail:response' || data.id !== id) return;
+                // M7: malformed envelope ⇒ ignore WITHOUT disarming the
+                // listener — a later valid response (or the timeout) still
+                // decides this request; a forged garbage message must not be
+                // able to kill a pending legitimate fetch.
+                if (!this._isValidDetailResponse(data)) {
+                    logger.debug('[R-DETAIL-FETCH] malformed gmp:detail:response ignored');
+                    return;
+                }
                 window.removeEventListener('message', handler);
                 clearTimeout(timer);
                 resolve({ ok: !!data.ok, fields: data.fields || null, status: data.status, latencyMs: data.latencyMs, error: data.error || null });
@@ -638,6 +902,34 @@ export class DOMObserver {
                 payload: { ...ids, query },
             }, location.origin);
         });
+    }
+
+    /**
+     * M7 FIX (2026-08-18): shape validation for a `gmp:detail:response`
+     * envelope before it enters the enrichment pipeline. Mirrors exactly what
+     * detail-fetcher.js posts (RESPONSE_CHANNEL emitter), so no legitimate
+     * response is rejected:
+     *   { ok: boolean, status: number|null, fields: object|null,
+     *     latencyMs: number|null, bodyKB: number|null, error: string|null }
+     * Known enrichment fields must carry the primitive type the fetcher emits
+     * — a forged object/array value would otherwise flow into the SW merge.
+     * @private
+     */
+    _isValidDetailResponse(data) {
+        if (typeof data.ok !== 'boolean') return false;
+        if (data.error != null && typeof data.error !== 'string') return false;
+        if (data.status != null && !Number.isFinite(data.status)) return false;
+        if (data.latencyMs != null && !Number.isFinite(data.latencyMs)) return false;
+        const f = data.fields;
+        if (f == null) return true;
+        if (typeof f !== 'object' || Array.isArray(f)) return false;
+        for (const key of ['phone', 'website', 'address', 'hoursRaw']) {
+            if (f[key] != null && typeof f[key] !== 'string') return false;
+        }
+        for (const key of ['rating', 'reviewCount', 'hoursDaysFound']) {
+            if (f[key] != null && !Number.isFinite(f[key])) return false;
+        }
+        return true;
     }
 
     /**
@@ -860,28 +1152,83 @@ export class DOMObserver {
 
     /**
      * R10: ship selector telemetry to the SW Statistics singleton via
-     * chrome.runtime. Resets the local engine counters only on success.
-     * Designed to never throw — telemetry must not break extraction.
+     * chrome.runtime. Designed to never throw — telemetry must not break
+     * extraction.
+     *
+     * M8 FIX (2026-08-18): reset-on-snapshot with a single pending immutable
+     * batch + SW-side batchId dedup. Pre-fix the engine counters were reset
+     * only on ack: when the SW recorded the snapshot but the ack was lost
+     * (port closed), the next flush re-sent the same deltas into the additive
+     * (deltaMode:false) sink ⇒ double count. Now:
+     *   - a batch is snapshotted and the engine reset ONCE, at batch creation;
+     *     deltas arriving while the batch is unacked keep accumulating in the
+     *     engine (bounded counters, not a queue) ⇒ nothing is lost;
+     *   - the batch is retransmitted VERBATIM (same batchId, same snapshot)
+     *     on every flush until acked;
+     *   - the SW dedups on batchId (lib/Statistics.ingestSelectorTelemetryBatch)
+     *     ⇒ "recorded but ack lost" counts exactly once.
+     * Cross-eviction honesty: the seen-ids live in SW memory with the SAME
+     * lifetime as the counters they protect — if the SW is evicted both are
+     * wiped, and re-ingesting the retransmitted batch into the fresh
+     * Statistics is RECOVERY of lost data, not double counting. Persisting
+     * the ids without the counters would turn that recovery into permanent
+     * loss, so storage is deliberately not used.
      * @private
      */
-    _flushSelectorTelemetry() {
+    _flushSelectorTelemetry(isFinal = false) {
         try {
             if (!this.selectorEngine || typeof this.selectorEngine.getTelemetry !== 'function') return;
-            const snapshot = this.selectorEngine.getTelemetry();
-            if (!snapshot || snapshot.length === 0) return;
-
+            if (!this._pendingTelemetryBatch) {
+                const snapshot = this.selectorEngine.getTelemetry();
+                if (!snapshot || snapshot.length === 0) return;
+                if (!this._telemetrySenderId) {
+                    // Per-instance namespace so concurrent tabs can never
+                    // collide on a batchId in the SW's seen-set.
+                    this._telemetrySenderId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+                    this._telemetryBatchSeq = 0;
+                }
+                this._pendingTelemetryBatch = {
+                    batchId: `${this._telemetrySenderId}:${++this._telemetryBatchSeq}`,
+                    snapshot,
+                };
+                // Reset-on-snapshot: from here on, new hits belong to the NEXT batch.
+                this.selectorEngine.resetTelemetry?.();
+            } else if (isFinal) {
+                // R5-5c FIX (2026-08-19, peer review): final flush (stop) with a
+                // retransmit still pending. The single-pending invariant means the
+                // deltas accumulated in the engine SINCE that batch was created
+                // (up to ~60s, the flush interval) were never snapshotted — and
+                // at teardown there is no next flush to pick them up. Ship them
+                // as ONE extra batch (own batchId, SW-side dedup untouched). The
+                // invariant is relaxed only here, where no further retransmit
+                // can ever happen; both sends stay best-effort (ack loss at
+                // teardown was already accepted loss).
+                const extra = this.selectorEngine.getTelemetry();
+                if (extra && extra.length > 0) {
+                    this.selectorEngine.resetTelemetry?.();
+                    const extraBatch = {
+                        batchId: `${this._telemetrySenderId}:${++this._telemetryBatchSeq}`,
+                        snapshot: extra,
+                    };
+                    chrome.runtime.sendMessage(
+                        { action: 'selector_telemetry', payload: extraBatch },
+                        () => { void chrome.runtime.lastError; }
+                    );
+                }
+            }
+            const batch = this._pendingTelemetryBatch;
             chrome.runtime.sendMessage(
-                { action: 'selector_telemetry', payload: { snapshot } },
+                { action: 'selector_telemetry', payload: { batchId: batch.batchId, snapshot: batch.snapshot } },
                 (response) => {
-                    // Treat both an explicit ack AND a missing response (port closed
-                    // because no listener) as best-effort delivery. Never throw.
+                    // Ack lost (port closed / SW evicted): keep the batch
+                    // pending — it will be retransmitted verbatim next flush,
+                    // and the SW-side dedup makes the retry idempotent.
                     if (chrome.runtime.lastError) {
                         logger.debug(`[R10] telemetry send: ${chrome.runtime.lastError.message}`);
                         return;
                     }
-                    if (response && response.ok) {
-                        // Success: reset local counters so we don't double-send.
-                        this.selectorEngine.resetTelemetry?.();
+                    if (response && response.ok && this._pendingTelemetryBatch === batch) {
+                        this._pendingTelemetryBatch = null;
                     }
                 }
             );
@@ -916,7 +1263,9 @@ export class DOMObserver {
             clearInterval(this._telemetryFlushInterval);
             this._telemetryFlushInterval = null;
         }
-        try { this._flushSelectorTelemetry(); } catch { /* best-effort */ }
+        // R5-5c: isFinal=true — if a retransmit is pending, also ship the
+        // deltas accumulated behind it (they would otherwise die with the tab).
+        try { this._flushSelectorTelemetry(true); } catch { /* best-effort */ }
 
         // R-DETAIL: detach detail-panel watcher.
         this._teardownDetailWatcher();
@@ -963,7 +1312,8 @@ export class DOMObserver {
         entries.forEach(entry => {
             if (entry.isIntersecting) {
                 const url = this.elementToUrl.get(entry.target);
-                if (url && !this.processedUrls.has(url)) {
+                // R3-C3a: retryable detail-fetch URLs pass the dedup gate.
+                if (url && (!this.processedUrls.has(url) || this._isDetailFetchRetryable(url))) {
                     this.addToProcessingQueue(entry.target, url);
                     if (this.intersectionObserver) {
                         this.intersectionObserver.unobserve(entry.target);
@@ -993,7 +1343,11 @@ export class DOMObserver {
         allLinks.forEach(link => {
             const url = this.extractBusinessUrl(link);
 
-            if (url && !this.processedUrls.has(url)) {
+            // R3-C3a (2026-08-18): the dedup gate also admits URLs whose
+            // detail-fetch marker is retryable (transient failure, budget
+            // left, cooldown elapsed) — pre-fix the M6 retry was unreachable
+            // because a once-processed card could never re-enter the pipeline.
+            if (url && (!this.processedUrls.has(url) || this._isDetailFetchRetryable(url))) {
                 this.elementToUrl.set(link, url);
                 // BLOCK-3 FIX (CRIT-006): Track pending element with timestamp
                 this._pendingElements.set(link, { url, addedAt: Date.now() });
@@ -1004,7 +1358,7 @@ export class DOMObserver {
         const fallbackLinks = getElements(CONFIG.selectors.businessLink, element);
         fallbackLinks.forEach(link => {
             const url = this.extractBusinessUrl(link);
-            if (url && !this.processedUrls.has(url)) {
+            if (url && (!this.processedUrls.has(url) || this._isDetailFetchRetryable(url))) {
                 this.addToProcessingQueue(link, url);
             }
         });
@@ -1066,7 +1420,13 @@ export class DOMObserver {
         while (this.processingQueue.length > 0) {
             const { element, url } = this.processingQueue.shift();
 
-            if (this.processedUrls.has(url)) {
+            // R3-C3a (2026-08-18): a once-processed URL is normally skipped,
+            // but when its detail-fetch marker is RETRYABLE the card passes
+            // as a retry-only re-processing: the fetch may fire again, while
+            // onNewBusiness is NOT re-emitted (the SW already holds the
+            // record; a re-send could clobber merged enrichment).
+            const isRetryPass = this.processedUrls.has(url);
+            if (isRetryPass && !this._isDetailFetchRetryable(url)) {
                 continue;
             }
 
@@ -1076,7 +1436,7 @@ export class DOMObserver {
                 const business = await this.extractBusinessData(element, url);
 
                 if (business) {
-                    this.onNewBusiness(business);
+                    if (!isRetryPass) this.onNewBusiness(business);
                     // R-DETAIL-FETCH (v9.8): if the card has no phone after
                     // DOM + state-watcher lookups, fire a network detail-fetch
                     // and merge the result via business_enrichment. Fire-and-
@@ -1084,6 +1444,9 @@ export class DOMObserver {
                     // 3-slot concurrency limiter, so card-discovery is never
                     // blocked. Gated behind CONFIG.detailFetch.enabled or
                     // window.__gmpEnableDetailFetch (console toggle).
+                    // On a retry pass whose re-extraction now HAS a phone,
+                    // this ships the recovered phone as a hole-filling
+                    // enrichment and closes the marker (R3-C3a).
                     this._maybeFireDetailFetch(business);
                 }
             } catch (error) {
@@ -1314,7 +1677,8 @@ export class DOMObserver {
         allLinks.forEach(link => {
             const url = this.extractBusinessUrl(link);
 
-            if (url && !this.processedUrls.has(url)) {
+            // R3-C3a: retryable detail-fetch URLs pass the dedup gate.
+            if (url && (!this.processedUrls.has(url) || this._isDetailFetchRetryable(url))) {
                 // Add directly to processing queue (skip IntersectionObserver)
                 this.addToProcessingQueue(link, url);
                 addedCount++;
@@ -1389,7 +1753,13 @@ export class DOMObserver {
         return {
             processed: this.processedUrls.size,
             queued: this.processingQueue.length,
-            isProcessing: this.isProcessing
+            isProcessing: this.isProcessing,
+            // R3-C1b (2026-08-18): latest JSPB drift-ledger snapshot ingested
+            // from the MAIN-world watcher ({canaryFailures, fallbackRecoveries,
+            // recordsChecked, total, updatedAt}) or null when none arrived yet.
+            // This is the console-free observability surface for the drift
+            // telemetry (see _ingestDriftTelemetry).
+            drift: this._driftTelemetry || null
         };
     }
 

@@ -28,7 +28,6 @@ import { sitemapDiscovery } from '../lib/SitemapDiscovery.js';
 // CURRENT record inside one readwrite tx and applies only this job's `updates`.
 import { updateBusinessMerge } from '../lib/db.js';
 import { buildBusinessUpdates, mergeSocialLinks, CIRCUIT_OPEN_ERROR } from '../lib/businessUpdates.js'; // PIVA-01, BUG-3, S8
-import { setupOffscreenDocument } from './offscreen-manager.js'; // HIGH FIX #5
 // B4-1: SessionPool no longer eager-imported — resolved lazily via _getPool()
 // from ServiceContainer to preserve restoreFromStorage semantics. The unused
 // getSessionPool/initializeSessionPool/setSessionPoolForStats imports are
@@ -1136,6 +1135,28 @@ function _accountedFetchError(message) {
 }
 
 /**
+ * R4 / M14-bis (2026-08-18): robots outcome SSOT.
+ *
+ * ROBOTS_TXT_DISALLOWED is the message of the per-page error the robots gate
+ * in fetchWebsiteHTML throws BEFORE the try block — so it never reaches the
+ * fetch catch (no markBad / recordCircuitFailure / AutoScaler accounting; the
+ * original M14 "counted as system-failure" finding is REFUTED by this layout).
+ *
+ * ROBOTS_DISALLOWED_MARKER is the scrapedFrom/scrapeError value stamped on the
+ * business row when a scrape ends email-less with a robots disallow as its
+ * final error — same lowercase honesty convention as 'cloudflare_protected',
+ * 'circuit_open' (S8) and 'skipped_invalid_url' (BUG-7). deriveScrapeStatus
+ * surfaces it as 'scrape_failed' (visible, never success/no_email). robots
+ * disallow is a PERMANENT-LEGITIMATE outcome in the S8 taxonomy: the job
+ * completes (retrying a policy is futile), but NEVER silently — the marker is
+ * mandatory — and the domain circuit breaker stays NEUTRAL (a disallow is not
+ * evidence the domain is failing, nor a "success" that should reset real
+ * failure counts).
+ */
+export const ROBOTS_TXT_DISALLOWED = 'ROBOTS_TXT_DISALLOWED';
+export const ROBOTS_DISALLOWED_MARKER = 'robots_disallowed';
+
+/**
  * Fetch website HTML with timeout, session tracking, and statistics
  * CRAWLEE-INSPIRED: Uses SessionPool for fingerprinting and tracks metrics
  * @param {string} url - URL to fetch
@@ -1172,7 +1193,7 @@ export async function fetchWebsiteHTML(url, pageContext = null) {
     if (!isAllowed) {
         clearTimeout(timeoutId);
         logger.info(`[ROBOTS] Blocked by robots.txt: ${url}`);
-        throw new Error('ROBOTS_TXT_DISALLOWED');
+        throw new Error(ROBOTS_TXT_DISALLOWED);
     }
 
     // Build hook context
@@ -1407,60 +1428,14 @@ export async function fetchWebsiteHTML(url, pageContext = null) {
     }
 }
 
-/**
- * Parse HTML in offscreen document with guaranteed initialization (HIGH FIX #5)
- * @param {string} html - Raw HTML content to parse
- * @param {string} url - Source URL of the HTML (for context)
- * @param {(html: string, url: string) => {emails: string[], socialLinks: Object, contactLinks?: string[], title?: string}} parseHTMLDirect - Fallback parser function if offscreen fails
- * @returns {Promise<{emails: string[], socialLinks: Object, contactLinks?: string[], title?: string}>} Parsed result containing emails and social links
- * @throws {Error} If both offscreen and direct parsing fail
- */
-export async function parseHTMLInOffscreen(html, url, parseHTMLDirect) {
-    // HIGH FIX #5: Ensure offscreen document exists before sending message
-    try {
-        await setupOffscreenDocument();
-    } catch (setupError) {
-        logger.warn('[OFFSCREEN] Setup failed, using direct parsing:', setupError.message);
-        return parseHTMLDirect(html, url);
-    }
-
-    // B4-5 fix: clear the race-timer on the success path so we don't leak
-    // a 10 s closure for every successful parse. On 200+ concurrent parses
-    // this previously added ~2 MB peak memory + a wasted CPU tick when the
-    // already-resolved race timer fired uselessly.
-    let parseTimeoutId;
-    const timeoutPromise = new Promise((_, reject) => {
-        parseTimeoutId = setTimeout(
-            () => reject(new Error('Offscreen timeout after 10s')),
-            10000
-        );
-    });
-
-    try {
-        // HIGH FIX #5: Add timeout to prevent hanging
-        const response = await Promise.race([
-            chrome.runtime.sendMessage({
-                action: 'parse_html',
-                target: 'offscreen',
-                payload: { html, url }
-            }),
-            timeoutPromise
-        ]);
-
-        if (response && response.success && response.source === 'offscreen') {
-            return response.data;
-        } else {
-            logger.warn('[OFFSCREEN] Invalid response, using direct parsing fallback');
-            return parseHTMLDirect(html, url);
-        }
-    } catch (error) {
-        logger.warn('[OFFSCREEN] Error, using direct parsing fallback:', error.message);
-        return parseHTMLDirect(html, url);
-    } finally {
-        // Always clear — success and error paths both pass through.
-        if (parseTimeoutId) clearTimeout(parseTimeoutId);
-    }
-}
+// Census 2026-08-19 (§5.8): the exported `parseHTMLInOffscreen` duplicate that
+// lived here was removed. Its only importer was an alias in background/index.js
+// that was never called; the parser actually used at runtime is the local
+// `parseHTMLInOffscreen` in background/index.js (15s timeout, requestId
+// correlation) — this copy had drifted to a 10s timeout and no correlation,
+// a latent behavior fork had anyone wired it in. Offscreen parsing enters this
+// module only via the `parseHTMLInOffscreenWrapper` parameter of
+// scrapeEmailForBusiness. Pinned by tests/run-census-dead-code-node.mjs.
 
 /**
  * Scrape emails from a business website using SEQUENTIAL page visiting strategy
@@ -1557,6 +1532,12 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
     let successfulPage = null;
     let lastError = null;
     let blockingErrorOccurred = false; // Track if we hit any CAPTCHA/Cloudflare even if 404s follow
+    // R5-2 FIX (2026-08-19, residuo R4): true quando ALMENO una pagina è stata
+    // fetchata con successo (policy-permessa). Il marker robots_disallowed
+    // afferma "non abbiamo potuto fetchare per policy" — se questa flag è
+    // true, quel claim è falso e il lastError robots va azzerato prima
+    // dell'accounting finale (vedi il clear sopra isRobotsOutcome).
+    let anyPageFetchedClean = false;
 
     try {
         const homepageUrl = business.website;
@@ -1575,6 +1556,16 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
         // Start both operations simultaneously
         const homepageFetchPromise = fetchWebsiteHTML(homepageUrl).catch(err => {
             logger.warn(`[P0 OPTIMIZATION] Homepage fetch failed: ${err.message}`);
+            // R4 / M14-bis: a robots disallow on the homepage MUST survive this
+            // swallow. Pre-fix it vanished here (return null, lastError never
+            // set); when the page loop then had nothing to visit (e.g. the
+            // sitemap only proposed the homepage), the business was saved with
+            // NO marker → export lied 'no_email' and the breaker even recorded
+            // success — a silent dishonest outcome. Seed lastError now; later
+            // page errors legitimately overwrite it, an email found clears it.
+            if (err?.message === ROBOTS_TXT_DISALLOWED) {
+                lastError = err;
+            }
             return null; // Don't fail the whole operation
         });
 
@@ -1590,14 +1581,19 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
         // Parse homepage IMMEDIATELY while sitemap may still be resolving
         let homepageEmailsFound = false;
         if (homepageHtml) {
+            anyPageFetchedClean = true;   // R5-2: la homepage è stata fetchata (policy-permessa)
             logger.info(`[P0 OPTIMIZATION] ⚡ Homepage fetched in ${homepageFetchTime}ms, parsing while sitemap resolves...`);
 
-            // Check for Cloudflare on homepage
-            if (isCloudflareChallenge(homepageHtml)) {
-                logger.warn(`⚠ [CLOUDFLARE] Challenge detected on homepage`);
-                throw new Error('CLOUDFLARE_PROTECTED');
-            }
-
+            // Census 2026-08-19 (§5.7): the Cloudflare re-check that lived here
+            // was removed as UNREACHABLE. homepageHtml comes exclusively from
+            // fetchWebsiteHTML(), whose single `return html` is preceded by the
+            // same isCloudflareChallenge(html) guard — a challenge page always
+            // THROWS the accounted CLOUDFLARE_PROTECTED (circuit failure +
+            // stats + 5min band) before reaching this caller. Had this branch
+            // ever fired, its raw `throw new Error('CLOUDFLARE_PROTECTED')`
+            // would have bypassed that accounting (no _accountedFetchError tag),
+            // double-counting in the catch below with the wrong DEFAULT band.
+            // Pinned by tests/run-census-dead-code-node.mjs.
             const homepageResult = await parseHTMLInOffscreenWrapper(homepageHtml, homepageUrl);
 
             // Capture Italian tax codes from homepage
@@ -1792,6 +1788,7 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
                 // Fetch HTML
                 logger.info(`[FETCH] Downloading HTML...`);
                 const html = await fetchWebsiteHTML(currentPage);
+                anyPageFetchedClean = true;   // R5-2: fetch riuscito = policy-permesso
                 const pageSize = html.length;
                 logger.info(`[HTML] Downloaded ${(pageSize / 1024).toFixed(1)} KB`);
 
@@ -2094,6 +2091,35 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
     const emailList = Array.from(allEmails);
     const duration = Date.now() - startTime;
 
+    // R4 / M14-bis (2026-08-18): robots disallow is a PERMANENT policy outcome.
+    // When the scrape ends email-less and the final error is the robots gate's,
+    // stamp the row with the honesty-convention marker (lowercase, like
+    // cloudflare_protected / circuit_open / skipped_invalid_url) instead of the
+    // raw internal constant + generic 'failed'. The job still completes
+    // (S8 taxonomy: PERMANENT-LEGITIMATE — retrying a policy is futile), but
+    // the outcome is visible: deriveScrapeStatus → 'scrape_failed'.
+    // R5-2 FIX (2026-08-19, residuo R4 dalla peer review): il marker robots
+    // afferma "la policy ci ha impedito di fetchare". Se almeno una pagina
+    // policy-permessa È stata fetchata con successo, quel claim è falso: un
+    // esito email-less qui è un onesto no_email (abbiamo scrapato e non
+    // c'erano email), non robots_disallowed. Pre-fix il lastError robots
+    // seminato dal prefetch homepage (o da una pagina disallowed successiva)
+    // non veniva mai azzerato dalle pagine fetchate pulite → riga mislabeled
+    // scrape_failed/robots_disallowed. Il clear è order-independent (flag, non
+    // posizione nel loop) e limitato al SOLO errore robots: gli altri lastError
+    // (404, timeout, Cloudflare…) restano il comportamento pre-esistente.
+    if (anyPageFetchedClean && lastError?.message === ROBOTS_TXT_DISALLOWED) {
+        logger.debug(`[ROBOTS] lastError robots azzerato: almeno una pagina policy-permessa è stata fetchata (claim "non fetchabile" falso)`);
+        lastError = null;
+    }
+    const isRobotsOutcome = emailList.length === 0 &&
+        lastError?.message === ROBOTS_TXT_DISALLOWED;
+    if (isRobotsOutcome) {
+        logger.warn(`[ROBOTS] Outcome for "${business.title}": ${ROBOTS_DISALLOWED_MARKER} (policy, permanent — no retry value)`);
+        lastError = new Error(ROBOTS_DISALLOWED_MARKER);
+        successfulPage = successfulPage || ROBOTS_DISALLOWED_MARKER;
+    }
+
     logger.info(`\n┌────────────────────────────────────────`);
     logger.info(`│ [COMPLETE] Finished processing "${business.title}"`);
     logger.info(`├────────────────────────────────────────`);
@@ -2141,7 +2167,14 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
         logger.info(`[NEXT] Ready for next business...\n`);
     } else {
         // CRIT-002 FIX: Record circuit result even for empty sites
-        if (lastError) {
+        // R4 / M14-bis: robots disallow is NEUTRAL for the breaker — it is not
+        // evidence the domain is failing (pre-fix it fed recordCircuitFailure:
+        // policy → breaker open → CIRCUIT_OPEN retries → mislabeled outcome),
+        // nor a "success" that should reset REAL failures accumulated by other
+        // businesses on the same domain.
+        if (isRobotsOutcome) {
+            logger.debug(`[CIRCUIT] Neutral: robots disallow on ${domain} is policy, not domain health`);
+        } else if (lastError) {
             await recordCircuitFailure(domain);
         } else {
             // Clean scrape with no emails = site is healthy, reset failure count
@@ -2236,7 +2269,6 @@ export default {
     getSessionHeaders,
     isCloudflareChallenge,
     fetchWebsiteHTML,
-    parseHTMLInOffscreen,
     scrapeEmailForBusiness,
     // Crawlee-inspired exports
     getCrawlerStats,

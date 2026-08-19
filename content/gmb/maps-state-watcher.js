@@ -69,7 +69,10 @@
  *     reviewsUrl         [4][3][0]              link to all reviews
  *     priceRangeText     [4][2]                 "20-30 €"
  *     priceHistogram     [4][9][0]              [{bucket, count, ratio}, ...] (review-perception)
- *     reviewSnippet      [142][1][0][0][0][0]   "Simpatici e alla mano, pizze e tiramisù top!"
+ *     reviewSnippet      [142][1][0][1][0][0]   "Simpatici e alla mano, pizze e tiramisù top!"
+ *                        (M4 doc fix 2026-08-18: header used to document a wrong
+ *                        4th index (0 instead of 1); the code has always read the
+ *                        path above — see extractBusiness)
  *
  *   STATUS / HOURS
  *     openStatusShort    [203][1][8][0]         "Aperto" / "Chiuso"
@@ -99,7 +102,9 @@
  * SECURITY POSTURE
  * ──────────────────────────────────────────────────────────────────────────
  * - Read-only; never mutates Maps internals.
- * - Posts only the derived business map (no raw state, no telemetry blobs).
+ * - Posts only the derived business map plus the aggregate drift counters
+ *   (`payload.drift` — M2/R3 2026-08-18: canaryFailures/fallbackRecoveries/
+ *   recordsChecked, numeri aggregati, MAI contenuto). No raw state blobs.
  * - `targetOrigin: location.origin` blocks cross-frame leaks.
  * - Idempotent install guard.
  */
@@ -112,7 +117,16 @@
 
     const CHANNEL = 'gmp:state-map';
     const POLL_INTERVAL_MS = 4000;
-    const MAX_POLL_MS = 5 * 60 * 1000;
+    // M5 FIX (2026-08-18): MAX_POLL_MS (5 min self-shutoff) REMOVED. The poll
+    // used to clearInterval itself 5 min after the last gmp:state-map-request.
+    // The ISOLATED observer's B2-1 re-arm (every 4 min) normally kept it alive
+    // — but if the observer dies/restarts or its re-arm timer is throttled
+    // (background tab: ISOLATED timers can be clamped to 1/min or worse), the
+    // poll died silently and capture stopped while the user kept navigating.
+    // Post-S1 the no-change tick is cheap (O(1) publish check), and since
+    // R3-C2b (2026-08-18) an unchanged payload is not even re-parsed (string
+    // identity gate in mergeFromInitialState), so the poll now runs for the
+    // tab's lifetime and is GC'd with the page context.
     const CID_RE = /^0x[0-9a-f]{16}:0x[0-9a-f]{16}$/i;
 
     // Verbose diagnostic toggle. `info` and `debug` calls are gated behind
@@ -141,21 +155,31 @@
     // that change will never reach the ISOLATED world.
     let accumulatorVersion = 0;      // bumped on every accumulator mutation
     let lastPublishedVersion = -1;   // -1 forces a publish on the next data-bearing tick
-    let pollStartedAt = Date.now();
-    let pollHandle = null;
+    // R3-C2b PERF FIX (2026-08-18): payload-identity gate for the 4 s re-merge.
+    // Post-S1 the PUBLISH check was O(1), but every tick still re-ran
+    // findJspbPayload + JSON.parse(~890KB) + the full walk on an UNCHANGED
+    // payload, forever. findJspbPayload returns a STRING; JS strings are
+    // immutable, so `raw === _lastMergedRawPayload` being true guarantees
+    // byte-identical content (=== on strings compares content, with an O(1)
+    // fast path for the common same-reference case) — skipping the parse can
+    // never miss data. A payload that fails JSON.parse fails deterministically,
+    // so caching it before the parse attempt is equally safe.
+    let _lastMergedRawPayload = null;
 
     // ──────────────────────────────────────────────────────────────────────
-    // SCROLL-CAPTURE (2026-05-06): Maps populates `APP_INITIALIZATION_STATE`
-    // ONCE at document-load with the initial batch of list-card data. As the
-    // user scrolls, Maps streams more cards via XHR/fetch (`/maps/preview/*`,
-    // `/maps/rpc/*`) — those payloads are JSPB-encoded with the same `)]}'`
-    // XSSI prefix and the same business-record shape. They are NEVER folded
-    // back into `APP_INITIALIZATION_STATE`, so a state-only watcher misses
-    // every business loaded after page render.
+    // DATA SOURCE (M3 doc fix 2026-08-18): Maps populates
+    // `APP_INITIALIZATION_STATE` ONCE at document-load with the initial batch
+    // of list-card data (~17-19 cards). That state — re-read by the 4 s poll —
+    // is the ONLY source feeding this accumulator. The v9.7 XHR/fetch scroll
+    // interceptor was REMOVED in v9.8 after empirical refutation (see the
+    // SCROLL-CAPTURE post-mortem note near the end of this file); cards beyond
+    // the initial batch are enriched by `content/gmb/detail-fetcher.js`, which
+    // never writes here.
     //
-    // We accumulate businesses across the entire session: initial state +
-    // every intercepted JSPB response. First-occurrence wins (the initial
-    // batch and detail XHRs tend to be richer than scroll-batch entries).
+    // We still accumulate across the session: SPA URL changes + the auto-
+    // reload guard can repopulate the state with new businesses under the
+    // same tab. First-occurrence wins (the initial batch tends to be the
+    // richest variant of a record).
     // ──────────────────────────────────────────────────────────────────────
     const accumulatedBusinesses = {};
     const ACCUMULATOR_CAP = 5000; // safety bound per session
@@ -729,15 +753,34 @@
     function mergeFromParsedJspb(parsed) {
         if (parsed == null) return 0;
         let added = 0;
+        // R3-C1a (2026-08-18): size tracked incrementally so the cap pre-check
+        // below stays O(1) per node instead of Object.keys() per candidate.
+        let size = Object.keys(accumulatedBusinesses).length;
         function walk(node) {
             if (!Array.isArray(node)) return;
             const inner = node[1];
             if (Array.isArray(inner) && inner.length > 10) {
-                const biz = extractBusiness(inner);
-                if (biz && biz.cid && !accumulatedBusinesses[biz.cid]) {
-                    if (Object.keys(accumulatedBusinesses).length < ACCUMULATOR_CAP) {
+                // R3-C1a DE-INFLATION FIX (2026-08-18): peek the CID slot and
+                // SKIP extraction for records already accumulated (or when the
+                // cap is reached). First-occurrence-wins means the extracted
+                // result was discarded anyway — but extractBusiness's
+                // getFirstValid/applyDriftCanaries calls re-bumped the drift
+                // ledger (canaryFailures / fallbackRecoveries / recordsChecked)
+                // on EVERY re-merge: one drifted record inflated its counter on
+                // each changed-payload merge (and, pre-identity-gate, on every
+                // 4 s tick), making the numbers quantitatively meaningless.
+                // Post-fix a drift bump is a per-RECORD event: it fires exactly
+                // once, when the record is first extracted. Duplicate CIDs
+                // deeper in the SAME payload are skipped too (the first
+                // occurrence has already inserted by the time they are walked).
+                const cidKey = typeof inner[10] === 'string' ? inner[10].toLowerCase() : null;
+                const alreadyAccumulated = cidKey != null && !!accumulatedBusinesses[cidKey];
+                if (!alreadyAccumulated && size < ACCUMULATOR_CAP) {
+                    const biz = extractBusiness(inner);
+                    if (biz && biz.cid && !accumulatedBusinesses[biz.cid]) {
                         accumulatedBusinesses[biz.cid] = biz;
                         accumulatorVersion++; // S1: the ONLY accumulator write — dirty-mark for the poll
+                        size++;
                         added++;
                     }
                 }
@@ -750,13 +793,18 @@
 
     /**
      * Refresh the accumulator from `APP_INITIALIZATION_STATE`. Idempotent:
-     * the initial batch's CIDs are already in the accumulator after the
-     * first call, so subsequent calls are no-ops (first-occurrence wins).
+     * an unchanged payload short-circuits at the identity gate (R3-C2b) with
+     * zero parse/walk cost; a changed payload merges only CIDs not already
+     * accumulated (first-occurrence wins, R3-C1a).
      */
     function mergeFromInitialState(state) {
         if (!state) return 0;
         const raw = findJspbPayload(state);
         if (!raw) return 0;
+        // R3-C2b (2026-08-18): identity gate — an unchanged payload string is
+        // never re-parsed/re-walked (see the _lastMergedRawPayload note above).
+        if (raw === _lastMergedRawPayload) return 0;
+        _lastMergedRawPayload = raw;
         const trimmed = raw.slice(raw.indexOf('\n') + 1);
         let parsed;
         try { parsed = JSON.parse(trimmed); } catch { return 0; }
@@ -786,7 +834,10 @@
         try {
             const state = window.APP_INITIALIZATION_STATE;
             // Refresh from initial state (idempotent — re-merges the same CIDs).
-            // Most new entries arrive via the network interceptor (XHR/fetch).
+            // M3 doc fix (2026-08-18): this IS the only ingestion point — the
+            // XHR/fetch network interceptor was removed in v9.8 (post-mortem
+            // note at the end of this file). New entries appear only when
+            // APP_INITIALIZATION_STATE itself changes (SPA nav / auto-reload).
             mergeFromInitialState(state);
             const businesses = accumulatedBusinesses;
             const sizeB = Object.keys(businesses).length;
@@ -808,6 +859,19 @@
                             ts: Date.now(),
                             drift: {
                                 canaryFailures: { ..._driftStats.canaryFailures },
+                                // M2 FIX (2026-08-18): ship the W1 fallback-
+                                // recovery ledger too. It used to live only in
+                                // a MAIN-world console.warn, where no operator,
+                                // ISOLATED consumer, SW or UI would ever see the
+                                // earliest signal of a live Google index
+                                // migration. Shipped as a COPY (spread), same as
+                                // canaryFailures, on the already-existing drift
+                                // channel. Deliberately NOT routed into the H7
+                                // `selector_telemetry` SW sink: that sink is
+                                // reset-on-ack delta-based — a cumulative ledger
+                                // there would re-create the M8 double-counting
+                                // shape.
+                                fallbackRecoveries: { ..._driftStats.fallbackRecoveries },
                                 recordsChecked: _driftStats.recordsChecked
                             }
                         }
@@ -870,13 +934,8 @@
                 try { console.debug('[GhostMap state-watcher] tick error:', e?.message); } catch { /* ignore */ }
             }
         }
-
-        if (Date.now() - pollStartedAt > MAX_POLL_MS) {
-            if (pollHandle) {
-                clearInterval(pollHandle);
-                pollHandle = null;
-            }
-        }
+        // M5 FIX (2026-08-18): no self-shutoff here anymore — the poll runs
+        // for the tab's lifetime (see the MAX_POLL_MS removal note at the top).
     }
 
     window.addEventListener('message', (event) => {
@@ -891,9 +950,15 @@
         // S1: force a republish on the next tick even if content is unchanged
         // (a fresh/re-armed observer needs the current snapshot; the ISOLATED
         // consumer merges idempotently, so an identical re-post is harmless).
+        // M5: the poll never self-stops anymore, so a request no longer resets
+        // any deadline — it only forces the republish and runs a tick now.
+        // R3-C2a (2026-08-18): the former `if (!pollHandle) …` "defensive
+        // re-arm" here was dead code — the interval id is assigned
+        // synchronously at install (before any message task can be delivered)
+        // and nothing in this file ever clears it; even an external
+        // clearInterval sweep would leave the id truthy, so the guard could
+        // not detect the one scenario it claimed to cover. Removed.
         lastPublishedVersion = -1;
-        pollStartedAt = Date.now();
-        if (!pollHandle) pollHandle = setInterval(tick, POLL_INTERVAL_MS);
         tick();
     });
 
@@ -1176,5 +1241,8 @@
     maybeAutoReloadForState();
 
     tick();
-    pollHandle = setInterval(tick, POLL_INTERVAL_MS);
+    // M5 (2026-08-18): the poll runs for the tab's lifetime — never
+    // self-cleared, GC'd with the page context. The interval id is
+    // deliberately not kept: nothing may stop this poll (R3-C2a).
+    setInterval(tick, POLL_INTERVAL_MS);
 })();

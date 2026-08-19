@@ -18,7 +18,16 @@
  *   - 429 / 503: retry up to MAX_RETRIES with exponential backoff.
  *   - Body is HTML (not JSON): treat as soft rate-limit, backoff.
  *   - Three consecutive failures: trip kill-switch, refuse new
- *     requests until reset() is called from ISOLATED side.
+ *     requests. Recovery (M1 FIX 2026-08-18): TEMPORAL HALF-OPEN — after
+ *     `killSwitchCooldownMs` the next legitimate request is attempted as
+ *     a single probe (success => full reset + tripped:false broadcast;
+ *     failure => immediate re-trip with a fresh cooldown) — or the
+ *     MAIN-world console reset hook exposed at the bottom of this file.
+ *     (NB: naming that hook here would hijack the first-match static pin
+ *     in tests/run-detail-fetcher-killswitch-signal-node.mjs.) There is
+ *     deliberately NO ISOLATED-side reset channel: any window message is
+ *     page-forgeable, and a forgeable reset would let a hostile page
+ *     re-open the switch in a loop, defeating its rate-limiting purpose.
  *
  * See `docs/MAPS_DETAIL_FETCH_REVERSE_ENGINEERING.md` for the pb
  * structure decode and the empirical performance baseline.
@@ -74,6 +83,11 @@
         maxRetries: 2,
         backoffBaseMs: 2000,         // 2s, 4s, 8s
         killSwitchAfterFails: 3,     // consecutive failures
+        // M1 FIX (2026-08-18): half-open probe cadence. After this long from
+        // the trip, ONE legitimate request is retried. Anti-abuse budget:
+        // 1 probe (<= maxRetries+1 HTTP attempts) per 120s window — negligible
+        // next to the 3-concurrent continuous traffic available UNtripped.
+        killSwitchCooldownMs: 120000,
     };
 
     // B2-4 FIX (2026-05-10): channel for kill-switch state broadcast.
@@ -88,6 +102,11 @@
     /** Kill switch — set true after N consecutive failures. */
     let killSwitchTripped = false;
     let consecutiveFails = 0;
+    // M1 FIX (2026-08-18): temporal half-open state (closure-private, page-
+    // unreadable). trippedAt anchors the cooldown; probeInflight guarantees
+    // at most ONE half-open probe per window even under racing requests.
+    let killSwitchTrippedAt = 0;
+    let halfOpenProbeInflight = false;
 
     /**
      * S2 FIX (2026-08-18): closure-latched mirror of the extension-side
@@ -130,19 +149,11 @@
         );
     }
 
-    /**
-     * Strip XSSI prefix `)]}'\n` and parse JSON.
-     * Returns null on parse failure (caller treats as rate-limit / shape change).
-     */
-    function parseXssiJson(text) {
-        if (typeof text !== 'string') return null;
-        if (!text.startsWith(")]}'")) return null;
-        try {
-            return JSON.parse(text.replace(/^\)\]\}'\s*/, ''));
-        } catch {
-            return null;
-        }
-    }
+    // Census 2026-08-19 (§5.2): parseXssiJson removed — zero call sites.
+    // The detail flow never parses the XSSI-JSON body structurally; it uses
+    // regex extraction on the raw text (extractFieldsFromBody below), which
+    // is deliberate: the JSPB shape drifts between place types.
+    // Pinned by tests/run-census-dead-code-node.mjs.
 
     /**
      * Extract fields from the place-detail response. Uses regex on the
@@ -395,10 +406,39 @@
     }
 
     /**
+     * R1 FIX (2026-08-18): (re-)trip the kill-switch — single named path.
+     * Re-anchors the cooldown and releases the half-open probe slot. Called
+     * by the generic threshold trip, UNCONDITIONALLY on half-open probe
+     * failure, and by the escape-hatch check in the dispatch completion
+     * below (a probe that threw before reaching the failure accounting).
+     *
+     * B2-4 FIX (2026-05-10): broadcast kill-switch state to ISOLATED world
+     * (observer.js) which forwards to SW + sidepanel UI. Pre-fix the kill
+     * switch was a silent state — sidepanel showed "scraping in progress"
+     * while ALL subsequent enrichment failed.
+     */
+    function tripKillSwitch() {
+        killSwitchTripped = true;
+        killSwitchTrippedAt = Date.now();
+        halfOpenProbeInflight = false;
+        try { console.warn('[GhostMap detail-fetcher] kill switch tripped (consecutiveFails=' + consecutiveFails + ')'); } catch { /* ignore */ }
+        try {
+            window.postMessage({
+                type: KILL_SWITCH_CHANNEL,
+                tripped: true,
+                consecutiveFails,
+                timestamp: Date.now()
+            }, location.origin);
+        } catch { /* ignore */ }
+    }
+
+    /**
      * Fetch with retry + exponential backoff on rate-limit signals.
      */
-    async function fetchPlaceDetail(payload) {
-        if (killSwitchTripped) {
+    async function fetchPlaceDetail(payload, isHalfOpenProbe = false) {
+        // M1: only the designated half-open probe may run while tripped —
+        // requests queued before the trip are still refused at dequeue time.
+        if (killSwitchTripped && !isHalfOpenProbe) {
             return { ok: false, error: 'kill_switch_tripped' };
         }
         const url = buildDetailUrl(payload);
@@ -410,6 +450,23 @@
             lastResult = result;
             if (result.ok) {
                 consecutiveFails = 0;
+                // M1: half-open probe succeeded — close the breaker fully and
+                // broadcast tripped:false so the UI banner clears (B2-4 parity
+                // with the console reset hook).
+                if (isHalfOpenProbe) {
+                    halfOpenProbeInflight = false;
+                    killSwitchTripped = false;
+                    killSwitchTrippedAt = 0;
+                    try { console.info('[GhostMap detail-fetcher] kill switch reset (half-open probe succeeded)'); } catch { /* ignore */ }
+                    try {
+                        window.postMessage({
+                            type: KILL_SWITCH_CHANNEL,
+                            tripped: false,
+                            consecutiveFails: 0,
+                            timestamp: Date.now()
+                        }, location.origin);
+                    } catch { /* ignore */ }
+                }
                 stats.succeeded++;
                 stats.latencyMs.push(result.latencyMs);
                 if (stats.latencyMs.length > 200) stats.latencyMs.shift();
@@ -432,22 +489,17 @@
         }
         consecutiveFails++;
         stats.failed++;
-        if (consecutiveFails >= CONFIG.killSwitchAfterFails) {
-            killSwitchTripped = true;
-            try { console.warn('[GhostMap detail-fetcher] kill switch tripped after', consecutiveFails, 'consecutive failures'); } catch { /* ignore */ }
-
-            // B2-4 FIX (2026-05-10): broadcast kill-switch state to ISOLATED
-            // world (observer.js) which forwards to SW + sidepanel UI. Pre-fix
-            // the kill switch was a silent state — sidepanel showed
-            // "scraping in progress" while ALL subsequent enrichment failed.
-            try {
-                window.postMessage({
-                    type: KILL_SWITCH_CHANNEL,
-                    tripped: true,
-                    consecutiveFails,
-                    timestamp: Date.now()
-                }, location.origin);
-            } catch { /* ignore */ }
+        // R1 FIX (2026-08-18): probe completion is its OWN path — a FAILED
+        // half-open probe re-trips UNCONDITIONALLY, whatever the counter
+        // says. The original M1 comment claimed "while tripped,
+        // consecutiveFails never drops below the threshold" — FALSE: a
+        // request dispatched BEFORE the trip that resolves with SUCCESS
+        // after it zeroes the counter (success path above), so a failed
+        // probe could arrive here with consecutiveFails < threshold, skip
+        // the trip block and leak halfOpenProbeInflight=true forever
+        // (every future probe refused until page reload).
+        if (isHalfOpenProbe || consecutiveFails >= CONFIG.killSwitchAfterFails) {
+            tripKillSwitch();
         }
         return lastResult || { ok: false, error: 'unknown' };
     }
@@ -588,7 +640,17 @@
             }, location.origin);
             return;
         }
-        if (killSwitchTripped) {
+        // M1 FIX (2026-08-18): temporal half-open. A tripped switch refuses
+        // requests only until `killSwitchCooldownMs` has elapsed since the
+        // trip; then exactly ONE request per window proceeds as a probe
+        // (claimed after payload validation below, so garbage can never
+        // consume the slot). Success closes the breaker; failure re-trips
+        // with a fresh cooldown. No new page-forgeable channel: a hostile
+        // page spamming forged requests gets at most 1 probe per window
+        // instead of 0 — the rate-limiting purpose of the switch survives.
+        if (killSwitchTripped
+            && (halfOpenProbeInflight
+                || Date.now() - killSwitchTrippedAt < CONFIG.killSwitchCooldownMs)) {
             window.postMessage({
                 type: RESPONSE_CHANNEL,
                 id,
@@ -608,7 +670,24 @@
             return;
         }
         stats.requested++;
-        dispatch(() => fetchPlaceDetail(payload)).then((result) => {
+        // M1: claim the single half-open probe slot (still tripped here means
+        // the cooldown has elapsed — the guard above already returned otherwise).
+        const isHalfOpenProbe = killSwitchTripped;
+        if (isHalfOpenProbe) halfOpenProbeInflight = true;
+        dispatch(() => fetchPlaceDetail(payload, isHalfOpenProbe)).then((result) => {
+            // R1 FIX (2026-08-18): escape hatch — every probe COMPLETION must
+            // release the single probe slot. Success and final-failure do it
+            // inside fetchPlaceDetail; but a probe that THROWS (e.g.
+            // encodeURIComponent URIError in buildDetailUrl on a lone-
+            // surrogate fid that passes SEC-01) is swallowed by dispatch's
+            // catch and would leak the slot forever. If the probe settled
+            // with the slot still claimed, treat it as a failed probe:
+            // re-trip with a fresh cooldown. (No interleaving hazard: this
+            // microtask runs before any new message event can claim the slot,
+            // and while leaked the guard above refuses everything anyway.)
+            if (isHalfOpenProbe && halfOpenProbeInflight) {
+                tripKillSwitch();
+            }
             window.postMessage({
                 type: RESPONSE_CHANNEL,
                 id,
@@ -644,6 +723,8 @@
     window.__ghostMapDetailFetcherReset = function () {
         killSwitchTripped = false;
         consecutiveFails = 0;
+        killSwitchTrippedAt = 0;        // M1: clear half-open state too
+        halfOpenProbeInflight = false;
         try { console.info('[GhostMap detail-fetcher] kill switch reset'); } catch { /* ignore */ }
 
         // B2-4 FIX (2026-05-10): broadcast reset event so UI can clear the

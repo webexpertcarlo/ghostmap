@@ -61,8 +61,7 @@ import { PerformanceMonitor } from './PerformanceMonitor.js';
 import {
     isValidScrapableUrl,
     scrapeEmailForBusiness as scrapeEmailForBusinessModule,
-    fetchWebsiteHTML,
-    parseHTMLInOffscreen as parseHTMLInOffscreenModule
+    fetchWebsiteHTML
 } from './email-scraper-v2.js';
 import {
     exportData as exportDataModule,
@@ -228,11 +227,25 @@ jobQueue.registerJobType('email_scrape', (params) => async () => {
         logger.debug(`[JobQueue] email_scrape: business no longer in DB (deleted between eviction and restore): ${key}`);
         return null;
     }
+    // M13 FIX (2026-08-18): boot recovery re-hydrates jobs from the S7
+    // ledger, but a job that COMPLETED right before SW eviction (fire-and-
+    // forget unpersist never landed) or a partially-completed batch would be
+    // re-executed against a business that is already enriched — a wasted
+    // full re-scrape. The fresh DB read above is the truth: if the business
+    // is already emailScraped, the job is an immediate no-op (same
+    // return-null convention as the deleted-business guard — counts as
+    // succeeded, never retried; pinned by S8 Test 4).
+    if (fresh.emailScraped === true) {
+        logger.debug(`[JobQueue] email_scrape: business already enriched (emailScraped=true), skipping: ${key}`);
+        return null;
+    }
     return await scrapeEmailForBusiness(fresh);
 });
 
-// Track offscreen document state
-let offscreenCreating = null;
+// Census 2026-08-19 (§5.6): the `offscreenCreating` shadow that lived here was
+// removed — it was declared and never used. The REAL single-flight creation
+// lock is background/offscreen-manager.js's module-scoped `offscreenCreating`.
+// Pinned by tests/run-census-dead-code-node.mjs.
 
 // PHASE 3 FIX #24: Progress tracking
 //
@@ -451,6 +464,18 @@ async function initialize() {
             try {
                 logger.info(`[JobQueue] 🔁 Auto-resuming ${_restoredJobCount} restored job(s) after SW boot`);
                 jobQueue.start();
+                // R5-F6 FIX (2026-08-19, review M9-M11): chi riprende un flusso
+                // arma il keepalive (pattern R2-F2, resume_email_scraping).
+                // Dopo una semplice eviction l'alarm persistito di solito
+                // sopravvive e questo create è un'idempotente sovrascrittura;
+                // ma dopo un riavvio del BROWSER la coda (storage.local)
+                // sopravvive mentre l'alarm no — pre-fix la ripresa correva
+                // senza protezione da eviction e moriva al primo gap idle di
+                // 30s, con il recupero S7 rinviato a un boot successivo che
+                // senza interazione utente può non arrivare mai. Dentro il try
+                // DI PROPOSITO: se start() lancia, nessun flusso è ripartito e
+                // un alarm nuovo sarebbe solo un fantasma.
+                startKeepAlive('email-scraping');
             } catch (resumeErr) {
                 logger.warn('[JobQueue] auto-resume failed:', resumeErr?.message || resumeErr);
             }
@@ -590,34 +615,105 @@ AreaSearch.setOnRunFinished((reason) => {
     logger.info(`[AREA SEARCH] Run finished (${reason}) — releasing keepalive holder`);
     stopKeepAlive('area-search');
 });
+// R5-F5 FIX (2026-08-19, review M9-M11): il respawn del run loop TURBO dopo
+// un'eviction (area-search.js, _restoreTurboState().then) riprende un flusso
+// e quindi RI-ARMA il keepalive — pattern R2-F2 (resume_email_scraping).
+// Normalmente l'alarm persistito è sopravvissuto all'eviction e il create è
+// un'idempotente sovrascrittura; nella finestra F8 (tick self-heal con
+// `_initialized=true` mentre il restore TURBO, fire-and-forget e non
+// sequenziato con initialize(), è ancora pendente → derivazione cieca →
+// alarm cancellato) questo re-arm è ciò che tiene vivo il respawn.
+AreaSearch.setOnRunResumed((reason) => {
+    logger.info(`[AREA SEARCH] Run resumed (${reason}) — re-arming keepalive`);
+    startKeepAlive('area-search');
+});
+
+// M9 FIX (2026-08-18): single source of truth for user-settings bounds,
+// applied at BOTH trust boundaries — the `update_settings` message AND the
+// storage load. Raw values in storage may be out of range (legacy UI, console
+// writes, old bugs); nothing enters memory without passing clampSetting().
+// Clamp-on-read is idempotent and side-effect free: storage deliberately
+// stays raw (no write-on-load — rewriting at boot would add races/failure
+// modes for zero benefit, since every read re-clamps).
+// P1-002 FIX: validation limits prevent resource exhaustion.
+// Forensic #10 (2026-06-11): maxConcurrent ceiling lowered 10→5 to match the
+// authoritative AutoScaler max (anti-detection design ceiling).
+const SETTINGS_LIMITS = {
+    maxConcurrent: { min: 1, max: 5 },     // 1-5 concurrent jobs (AutoScaler ceiling)
+    rateLimit: { min: 2, max: 60 },        // 2-60 requests per minute
+    timeout: { min: 5, max: 120 }          // 5-120 seconds
+};
+
+/**
+ * Clamp a user-settings value into its SETTINGS_LIMITS range.
+ * @returns {number|null} clamped integer, or null when the raw value is not
+ *          numeric (caller skips the field instead of writing NaN to memory).
+ */
+function clampSetting(name, rawValue) {
+    const parsed = parseInt(rawValue);
+    if (!Number.isFinite(parsed)) return null;
+    const { min, max } = SETTINGS_LIMITS[name];
+    return Math.max(min, Math.min(max, parsed));
+}
 
 /**
  * Load settings from storage
  */
 async function loadSettings() {
     try {
-        const { userSettings } = await chrome.storage.local.get(['userSettings']);
+        // NEW-1 FIX (2026-08-18): read the key the UI actually writes.
+        // The UI persists { rateLimit, maxConcurrent, timeout } under
+        // `ghostMapSettings` (ui/sidepanel.js saveSettings); the previously
+        // read `userSettings` key has ZERO writers in the entire git history
+        // (`git log --all -S` verified), so this function was a no-op on every
+        // real install and user settings died with each SW eviction (~30s
+        // idle). Field names are identical — no mapping. `userSettings` is
+        // kept as a one-line read-only fallback (console/hypothetical legacy
+        // writes, and it keeps the M9 clamp-at-load pins meaningful);
+        // `ghostMapSettings` always wins. Every value still passes
+        // clampSetting() — the boot now applies UI values that were silently
+        // ignored before, including absurd ones saved months ago.
+        const stored = await chrome.storage.local.get(['ghostMapSettings', 'userSettings']);
+        const userSettings = stored.ghostMapSettings ?? stored.userSettings;
 
         if (userSettings && jobQueue) {
             // Apply settings to job queue.
             // Forensic #10 (2026-06-11): also drive the AutoScaler — the run
             // loop reads autoScaler.getConcurrency(), so without this the
-            // persisted setting was write-only across SW restarts. Clamp 1-5
-            // (authoritative anti-detection ceiling); setConcurrency re-clamps
-            // into the scaler's own [min,max] anyway (defense in depth).
+            // persisted setting was write-only across SW restarts. Clamp via
+            // the shared SETTINGS_LIMITS (M9); setConcurrency re-clamps into
+            // the scaler's own [min,max] anyway (defense in depth).
             if (userSettings.maxConcurrent) {
-                const mc = Math.max(1, Math.min(5, parseInt(userSettings.maxConcurrent) || 1));
-                jobQueue.maxConcurrent = mc;
-                try { getAutoScaler().setConcurrency(mc); } catch { /* scaler not ready: initialize() applies authoritative config */ }
+                const mc = clampSetting('maxConcurrent', userSettings.maxConcurrent);
+                if (mc !== null) {
+                    jobQueue.maxConcurrent = mc;
+                    try { getAutoScaler().setConcurrency(mc); } catch { /* scaler not ready: initialize() applies authoritative config */ }
+                }
             }
 
-            // Update rate limiting (approximate since we use Gaussian)
+            // Update rate limiting (approximate since we use Gaussian).
+            // M9 FIX: rateLimit was applied RAW here (no clamp) — an
+            // out-of-range persisted value (e.g. 1000/min → 60ms mean delay)
+            // re-entered memory at every boot, forever.
             if (userSettings.rateLimit) {
-                // Convert req/min to mean delay in ms
-                // 60000ms / rateLimit = meanDelay
-                jobQueue.meanDelayMs = 60000 / userSettings.rateLimit;
-                // Adjust jitter to be 25% of mean delay
-                jobQueue.jitterStdDev = jobQueue.meanDelayMs * 0.25;
+                const rl = clampSetting('rateLimit', userSettings.rateLimit);
+                if (rl !== null) {
+                    // Convert req/min to mean delay in ms (60000ms / rl)
+                    jobQueue.meanDelayMs = Math.floor(60000 / rl);
+                    // Adjust jitter to be 25% of mean delay
+                    jobQueue.jitterStdDev = jobQueue.meanDelayMs * 0.25;
+                }
+            }
+
+            // NEW-1 FIX: also apply `timeout` at the storage boundary —
+            // mirrors the runtime boundary (case 'update_settings'), otherwise
+            // the third persisted field stays a victim of the same bug and
+            // resets to default at every SW eviction.
+            if (userSettings.timeout) {
+                const to = clampSetting('timeout', userSettings.timeout);
+                if (to !== null) {
+                    CONFIG.rateLimits.emailScraping.timeout = to * 1000;
+                }
             }
 
             logger.info(`Settings loaded: ${JSON.stringify(userSettings)}`);
@@ -870,10 +966,15 @@ async function handleMessage(message, sender) {
                     const snapshot = payload?.snapshot;
                     if (Array.isArray(snapshot) && snapshot.length > 0) {
                         const stats = getStatistics();
-                        if (stats && typeof stats.recordSelectorTelemetry === 'function') {
-                            // deltaMode=false: each content-script flush is the
-                            // delta since last flush (sender resets on ack), so
-                            // we want additive accumulation here.
+                        // M8 FIX (2026-08-18): idempotent ingest. Each flush is
+                        // a delta batch with a batchId; the sender retransmits
+                        // the SAME batch until acked, so a lost ack must not
+                        // double-count — Statistics dedups on batchId (in
+                        // memory, same lifetime as the counters it protects).
+                        if (stats && typeof stats.ingestSelectorTelemetryBatch === 'function') {
+                            stats.ingestSelectorTelemetryBatch({ batchId: payload?.batchId, snapshot });
+                        } else if (stats && typeof stats.recordSelectorTelemetry === 'function') {
+                            // Legacy fallback (pre-M8 Statistics build).
                             stats.recordSelectorTelemetry(snapshot, { deltaMode: false });
                         }
                     }
@@ -894,24 +995,53 @@ async function handleMessage(message, sender) {
             // @deprecated 2026-05-07 (audit): no UI caller located in ui/*.js.
             // `update_settings` (case at :613) is the live UI path. This `update_config`
             // form is a legacy variant — candidate for removal in v9.13.
-            case 'update_config':
-                if (message.settings) {
+            case 'update_config': {
+                // R2-F3 (review M9/M10, 2026-08-18): this deprecated path
+                // applied RAW values — no clampSetting (M9's single source of
+                // truth), so maxConcurrent was unbounded and a non-numeric
+                // rateLimit put NaN into meanDelayMs/jitterStdDev — and the
+                // M10 reply claimed `applied: true` unconditionally. Route
+                // every value through clampSetting (skip non-numerics) and
+                // report what was ACTUALLY applied: `applied` is the map of
+                // effective (clamped) values, or `false` when nothing landed.
+                // The case itself stays (dead-code census = step 23, out of
+                // scope); reachable only via API/console.
+                const appliedFields = {};
+                if (message.settings && jobQueue) {
                     const s = message.settings;
-                    if (jobQueue) {
-                        if (s.maxConcurrent) jobQueue.maxConcurrent = s.maxConcurrent;
-                        if (s.rateLimit) {
-                            jobQueue.meanDelayMs = 60000 / s.rateLimit;
-                            jobQueue.jitterStdDev = jobQueue.meanDelayMs * 0.25;
+                    if (s.maxConcurrent !== undefined) {
+                        const mc = clampSetting('maxConcurrent', s.maxConcurrent);
+                        if (mc !== null) {
+                            jobQueue.maxConcurrent = mc;
+                            appliedFields.maxConcurrent = mc;
                         }
-                        logger.info(`Settings updated: ${JSON.stringify(s)}`);
                     }
+                    if (s.rateLimit !== undefined) {
+                        const rl = clampSetting('rateLimit', s.rateLimit);
+                        if (rl !== null) {
+                            jobQueue.meanDelayMs = Math.floor(60000 / rl);
+                            jobQueue.jitterStdDev = jobQueue.meanDelayMs * 0.25;
+                            appliedFields.rateLimit = rl;
+                        }
+                    }
+                    logger.info(`Settings updated (clamped): ${JSON.stringify(appliedFields)}`);
                 }
                 if (message.config && message.config.selectors) {
                     // Step 03-03: Use safeMerge to prevent prototype pollution (M2-SEC2)
                     safeMerge(CONFIG.selectors, message.config.selectors);
+                    appliedFields.selectors = true;
                     logger.info(`Selectors updated: ${JSON.stringify(message.config.selectors)}`);
                 }
-                break;
+                // M10 FIX (2026-08-18): this case ended with a bare `break` —
+                // the switch has no code after it, so awaiting callers got
+                // `undefined`, indistinguishable from an evicted SW (post-S3
+                // the content bridge treats undefined as transient and
+                // retries). Reply with the project's conventional shape,
+                // mirroring the sibling `update_settings` case; R2-F3 makes
+                // `applied` truthful instead of a hardcoded true.
+                const anyApplied = Object.keys(appliedFields).length > 0;
+                return { status: 'updated', applied: anyApplied ? appliedFields : false };
+            }
 
             case 'start_email_scraping':
                 return await startEmailScraping();
@@ -919,17 +1049,35 @@ async function handleMessage(message, sender) {
             case 'stop_email_scraping':
                 return stopEmailScraping();
 
-            case 'resume_email_scraping':
+            case 'resume_email_scraping': {
                 // BUG FIX #3: Add resume handler for paused queue
                 jobQueue.resume();
                 const resumeStatus = jobQueue.getStatus();
+                // R2-F2 (review M11, 2026-08-18): a user pause releases the
+                // keepalive alarm BY DESIGN (M11: parked queue = the SW may
+                // sleep; even if stopKeepAlive missed it, the tick self-heal
+                // clears it — and an eviction during the pause is safe: the
+                // persisted queue rehydrates + auto-resumes at the boot the
+                // user's next interaction causes). The resume must therefore
+                // RE-ARM the alarm, or the resumed run proceeds with no
+                // eviction protection and dies at the first 30s idle gap.
+                // Armed only when there is actual work (pending/active/
+                // backoff); on an empty queue an alarm would just be created
+                // for the next tick's self-heal to clear.
+                const resumeHasWork = (resumeStatus.pending || 0) + (resumeStatus.active || 0) + (resumeStatus.backoff || 0) > 0;
+                if (resumeHasWork) {
+                    startKeepAlive('email-scraping');
+                }
                 logger.info(`Queue resumed by user. Pending: ${resumeStatus.pending}, Active: ${resumeStatus.active}`);
                 return {
                     status: 'resumed',
                     pending: resumeStatus.pending,
                     active: resumeStatus.active
                 };
+            }
 
+            // @api-surface (census 2026-08-19): no UI caller — console/recovery
+            // endpoint, kept deliberately (see run-census-dead-code-node.mjs §5.5).
             // SAVE-DLQ (2026-05-28): drain the save dead-letter queue on demand.
             // Single-attempt (retry:false), budgeted inside drainDeadLetter so a
             // large queue can't stall. Mirrors retry_failed_businesses below.
@@ -1040,18 +1188,13 @@ async function handleMessage(message, sender) {
                 }
 
             case 'update_settings':
-                // P1-002 FIX: Define validation limits to prevent resource exhaustion.
-                // Forensic #10 (2026-06-11): maxConcurrent ceiling lowered 10→5 to
-                // match the authoritative AutoScaler max (anti-detection design
-                // ceiling). The slider used to allow 1-10 while the scaler clamped
-                // to its own range, and — worse — nothing applied the value to the
+                // P1-002 / Forensic #10 / M9: validation limits live in the
+                // module-level SETTINGS_LIMITS + clampSetting() (single source
+                // of truth, shared with loadSettings — the storage boundary).
+                // The slider used to allow 1-10 while the scaler clamped to its
+                // own range, and — worse — nothing applied the value to the
                 // scaler at all (it was write-only: the run loop reads
                 // autoScaler.getConcurrency(), never jobQueue.maxConcurrent).
-                const SETTINGS_LIMITS = {
-                    maxConcurrent: { min: 1, max: 5 },     // 1-5 concurrent jobs (AutoScaler ceiling)
-                    rateLimit: { min: 2, max: 60 },        // 2-60 requests per minute
-                    timeout: { min: 5, max: 120 }          // 5-120 seconds
-                };
 
                 // Apply settings immediately to jobQueue for seamless UX
                 if (message.settings && jobQueue) {
@@ -1059,53 +1202,59 @@ async function handleMessage(message, sender) {
 
                     if (s.maxConcurrent !== undefined) {
                         // P1-002 FIX: Validate and clamp maxConcurrent
-                        const mc = parseInt(s.maxConcurrent);
-                        const validMC = Math.max(SETTINGS_LIMITS.maxConcurrent.min,
-                            Math.min(SETTINGS_LIMITS.maxConcurrent.max, mc));
-                        if (mc !== validMC) {
-                            logger.warn(`[SETTINGS] maxConcurrent ${mc} clamped to ${validMC} (valid: ${SETTINGS_LIMITS.maxConcurrent.min}-${SETTINGS_LIMITS.maxConcurrent.max})`);
+                        const validMC = clampSetting('maxConcurrent', s.maxConcurrent);
+                        if (validMC === null) {
+                            logger.warn(`[SETTINGS] maxConcurrent ${s.maxConcurrent} is not numeric — ignored`);
+                        } else {
+                            if (parseInt(s.maxConcurrent) !== validMC) {
+                                logger.warn(`[SETTINGS] maxConcurrent ${s.maxConcurrent} clamped to ${validMC} (valid: ${SETTINGS_LIMITS.maxConcurrent.min}-${SETTINGS_LIMITS.maxConcurrent.max})`);
+                            }
+                            jobQueue.maxConcurrent = validMC;
+                            // Forensic #10: actually DRIVE the live scaler — this is the
+                            // value the run loop reads (autoScaler.getConcurrency()).
+                            // Without this the slider was a no-op that logged "success".
+                            try {
+                                getAutoScaler().setConcurrency(validMC);
+                            } catch (e) {
+                                logger.warn(`[SETTINGS] could not apply maxConcurrent to AutoScaler: ${e?.message || e}`);
+                            }
+                            logger.info(`[SETTINGS] maxConcurrent set to ${jobQueue.maxConcurrent} (AutoScaler desiredConcurrency updated)`);
                         }
-                        jobQueue.maxConcurrent = validMC;
-                        // Forensic #10: actually DRIVE the live scaler — this is the
-                        // value the run loop reads (autoScaler.getConcurrency()).
-                        // Without this the slider was a no-op that logged "success".
-                        try {
-                            getAutoScaler().setConcurrency(validMC);
-                        } catch (e) {
-                            logger.warn(`[SETTINGS] could not apply maxConcurrent to AutoScaler: ${e?.message || e}`);
-                        }
-                        logger.info(`[SETTINGS] maxConcurrent set to ${jobQueue.maxConcurrent} (AutoScaler desiredConcurrency updated)`);
                     }
 
                     if (s.rateLimit !== undefined && s.rateLimit > 0) {
                         // P1-002 FIX: Validate and clamp rateLimit
-                        const rl = parseInt(s.rateLimit);
-                        const validRL = Math.max(SETTINGS_LIMITS.rateLimit.min,
-                            Math.min(SETTINGS_LIMITS.rateLimit.max, rl));
-                        if (rl !== validRL) {
-                            logger.warn(`[SETTINGS] rateLimit ${rl} clamped to ${validRL} (valid: ${SETTINGS_LIMITS.rateLimit.min}-${SETTINGS_LIMITS.rateLimit.max})`);
+                        const validRL = clampSetting('rateLimit', s.rateLimit);
+                        if (validRL !== null) {
+                            if (parseInt(s.rateLimit) !== validRL) {
+                                logger.warn(`[SETTINGS] rateLimit ${s.rateLimit} clamped to ${validRL} (valid: ${SETTINGS_LIMITS.rateLimit.min}-${SETTINGS_LIMITS.rateLimit.max})`);
+                            }
+                            // rateLimit is requests per minute, convert to delay
+                            jobQueue.meanDelayMs = Math.floor(60000 / validRL);
+                            jobQueue.jitterStdDev = jobQueue.meanDelayMs * 0.25;
+                            logger.info(`[SETTINGS] rateLimit set to ${validRL}/min (delay: ${jobQueue.meanDelayMs}ms)`);
                         }
-                        // rateLimit is requests per minute, convert to delay
-                        jobQueue.meanDelayMs = Math.floor(60000 / validRL);
-                        jobQueue.jitterStdDev = jobQueue.meanDelayMs * 0.25;
-                        logger.info(`[SETTINGS] rateLimit set to ${validRL}/min (delay: ${jobQueue.meanDelayMs}ms)`);
                     }
 
                     if (s.timeout !== undefined) {
                         // P1-002 FIX: Validate and clamp timeout
-                        const to = parseInt(s.timeout);
-                        const validTO = Math.max(SETTINGS_LIMITS.timeout.min,
-                            Math.min(SETTINGS_LIMITS.timeout.max, to));
-                        if (to !== validTO) {
-                            logger.warn(`[SETTINGS] timeout ${to}s clamped to ${validTO}s (valid: ${SETTINGS_LIMITS.timeout.min}-${SETTINGS_LIMITS.timeout.max})`);
+                        const validTO = clampSetting('timeout', s.timeout);
+                        if (validTO !== null) {
+                            if (parseInt(s.timeout) !== validTO) {
+                                logger.warn(`[SETTINGS] timeout ${s.timeout}s clamped to ${validTO}s (valid: ${SETTINGS_LIMITS.timeout.min}-${SETTINGS_LIMITS.timeout.max})`);
+                            }
+                            // Store in CONFIG for future use
+                            CONFIG.rateLimits.emailScraping.timeout = validTO * 1000;
+                            logger.info(`[SETTINGS] timeout set to ${validTO}s`);
                         }
-                        // Store in CONFIG for future use
-                        CONFIG.rateLimits.emailScraping.timeout = validTO * 1000;
-                        logger.info(`[SETTINGS] timeout set to ${validTO}s`);
                     }
                 }
-                // Also persist to storage
-                await loadSettings();
+                // M9 FIX (2026-08-18): the former trailing `await loadSettings()`
+                // (mislabeled as persistence — it never wrote anything) re-read
+                // the legacy `userSettings` storage key and re-applied its RAW
+                // values over the just-clamped ones, self-annulling this
+                // handler. Persistence is UI-side (`ghostMapSettings`,
+                // ui/sidepanel.js saveSettings) — nothing to do here.
                 return { status: 'updated', applied: true };
 
             case 'clear_data':
@@ -1283,6 +1432,9 @@ async function handleMessage(message, sender) {
                 }
             }
 
+            // @deprecated 2026-08-19 (census): no UI caller — the storage modal
+            // moved to the ID-batch flow (get_old_business_ids +
+            // delete_business_batch). Kept as console/API surface.
             case 'get_all_businesses':
                 // AUDIT FIX: Added error handling and consistent response format
                 try {
@@ -1355,11 +1507,14 @@ async function handleMessage(message, sender) {
             case API_MESSAGE_TYPES.API_HEALTH_CHECK:
                 return ExportAPI.handleApiMessage(message, sender);
 
+            // @api-surface (census 2026-08-19): no UI caller — external-integration
+            // key management, reachable from console/tooling. Kept deliberately.
             case 'api_get_key':
                 // Get or create API key for external integrations
                 const apiKey = await ExportAPI.getOrCreateApiKey();
                 return { success: true, apiKey };
 
+            // @api-surface (census 2026-08-19): no UI caller — see api_get_key.
             case 'api_regenerate_key':
                 // Regenerate API key (invalidates old key)
                 const newApiKey = await ExportAPI.regenerateApiKey();
@@ -2879,16 +3034,29 @@ function broadcastMessage(message) {
     }
 
     // BUG-003 FIX: Check message size before sending to prevent silent data loss
+    // M17-1 FIX (2026-08-19): truncation is no longer SILENT data loss. Pre-fix
+    // the businesses array was halved ONCE with no in-band signal — the UI had
+    // no way to know items were dropped, and a single halving did not even
+    // guarantee the message fit. Now: halve until it fits, and annotate the
+    // payload with `truncated: true` + `totalCount` (real pre-truncation
+    // length) so the UI can react. Small payloads keep the exact same shape
+    // (annotation only happens on the truncation path).
     const MAX_MESSAGE_SIZE = 64 * 1024; // 64KB safe limit
     try {
-        const messageSize = JSON.stringify(message).length;
+        let messageSize = JSON.stringify(message).length;
         if (messageSize > MAX_MESSAGE_SIZE) {
             logger.error(`[BROADCAST] Message too large (${messageSize} bytes > ${MAX_MESSAGE_SIZE}). Data may be lost.`);
-            // Truncate payload if possible
+            // Truncate payload if possible — and say so in the payload itself.
             if (message.payload && Array.isArray(message.payload.businesses)) {
-                const truncatedCount = Math.floor(message.payload.businesses.length / 2);
-                message.payload.businesses = message.payload.businesses.slice(0, truncatedCount);
-                logger.warn(`[BROADCAST] Truncated businesses to ${truncatedCount} items`);
+                const totalCount = message.payload.businesses.length;
+                message.payload.truncated = true;
+                message.payload.totalCount = totalCount;
+                while (messageSize > MAX_MESSAGE_SIZE && message.payload.businesses.length > 0) {
+                    message.payload.businesses = message.payload.businesses
+                        .slice(0, Math.floor(message.payload.businesses.length / 2));
+                    messageSize = JSON.stringify(message).length;
+                }
+                logger.warn(`[BROADCAST] Truncated businesses to ${message.payload.businesses.length}/${totalCount} items (payload flagged truncated:true)`);
             }
         }
     } catch (sizeError) {
@@ -2973,6 +3141,52 @@ function broadcastMessage(message) {
 // (persisted) alarm, which is the pre-existing best-effort behavior.
 const _keepAliveHolders = new Set();
 
+// M11 FIX (2026-08-18): the holder Set above is IN-MEMORY and restarts EMPTY
+// after SW eviction, while the persistent 'keepalive' chrome.alarm and the
+// flows it protects survive (jobQueue is rehydrated + auto-resumed at boot,
+// TURBO_STATE is chrome.storage.session-backed). Pre-fix, the first
+// stopKeepAlive() of the new SW life found size 0 and cleared the alarm while
+// the OTHER flow was still running → the SW could be evicted mid-flow.
+// Fix = DERIVE activity from state instead of trusting the counter alone.
+// Activity sources are the same eviction-safe state that recovery already
+// trusts; no new persisted state, no TTL, no reconciliation machinery.
+function _isAnyFlowObservablyActive() {
+    // Email scraping: jobs in flight, or pending jobs the queue will process.
+    // Pending jobs count UNLESS the queue was parked by the USER (pause/stop).
+    // A circuit-breaker halt also parks the queue (stop() → isPaused=true) but
+    // holds a live auto-restart setTimeout that dies with the SW — it MUST
+    // keep the alarm; `_stoppedByCircuit` pins exactly that window (user
+    // pause/stop/start all clear it).
+    try {
+        const q = jobQueue?.getStatus?.();
+        if (q) {
+            if (q.active > 0) return true;
+            if (q.pending > 0 && (!q.isPaused || jobQueue._stoppedByCircuit === true)) return true;
+            // R2-F1 (review M11, 2026-08-18): a job in retry-backoff is
+            // NEITHER active nor pending — it lives only in a setTimeout
+            // closure that dies with the SW (plus its S7 ledger entry). If it
+            // was the last job, onQueueEmpty fires and — pre-fix — this
+            // derivation said "idle", the alarm was cleared (stopKeepAlive
+            // AND the tick self-heal), the SW got evicted and the retry died
+            // silently: the ledger recovers it only at the NEXT boot, which
+            // never comes until the user reopens the UI. Count LIVE backoff
+            // windows (getStatus().backoff excludes timer-killed ones) as
+            // activity. Same user-pause gate as `pending`: pause() keeps the
+            // timers alive, so on a surviving SW the job simply re-enters the
+            // parked `pending`; on an evicted SW the ledger recovers it at
+            // the boot the user's resume interaction necessarily causes.
+            if (q.backoff > 0 && !q.isPaused) return true;
+        }
+    } catch (_) { /* unreadable queue = not observably active (conservative) */ }
+    // Area search: TURBO_STATE.isRunning (session-backed, restored on boot).
+    // finishTurbo/stopTurbo flip it to false BEFORE the onRunFinished hook
+    // calls stopKeepAlive, so the final release still clears the alarm.
+    try {
+        if (AreaSearch?.status?.()?.isRunning) return true;
+    } catch (_) { /* ditto */ }
+    return false;
+}
+
 function startKeepAlive(holder) {
     _keepAliveHolders.add(holder || 'default');
     // B1-1 fix: 0.5min = 30s, the documented MV3 minimum.
@@ -2995,8 +3209,16 @@ function stopKeepAlive(holder) {
         logger.debug(`[KEEPALIVE] Holder '${holder || 'default'}' released; still held by: ${[..._keepAliveHolders].join(',')}`);
         return;
     }
+    // M11 FIX: holders are in-memory and reset by eviction — size 0 is NOT
+    // proof that no flow is running. Clear only when the derived, eviction-
+    // safe activity check agrees; otherwise keep the alarm and let the
+    // surviving flow's own stop (or the tick self-heal below) release it.
+    if (_isAnyFlowObservablyActive()) {
+        logger.debug(`[KEEPALIVE] Holder '${holder || 'default'}' released but a flow is still observably active — keeping alarm`);
+        return;
+    }
     chrome.alarms.clear('keepalive');
-    logger.debug('[KEEPALIVE] Stopped (no holders left)');
+    logger.debug('[KEEPALIVE] Stopped (no holders left, no active flow)');
 }
 
 // Factory reset / global teardown: drop every holder and clear the alarm.
@@ -3016,6 +3238,17 @@ chrome.alarms.onAlarm.addListener((alarm) => {
             // Ignore — keepalive is best-effort
         });
         logger.debug('[KEEPALIVE] Idle timer reset via getPlatformInfo');
+        // M11 FIX: self-heal the inverse leak — alarm alive with NO observably
+        // active flow (flow crashed without stop, onQueueEmpty missed, or a
+        // post-eviction ghost alarm whose flows never resumed). Gated on
+        // _initialized: post-eviction this tick can fire BEFORE recovery
+        // rehydrates queue/turbo state, and clearing on that blind spot would
+        // kill the keepalive the surviving flow still needs.
+        if (_initialized && !_isAnyFlowObservablyActive()) {
+            _keepAliveHolders.clear();
+            chrome.alarms.clear('keepalive');
+            logger.debug('[KEEPALIVE] Self-heal: no active flow at tick — alarm cleared');
+        }
     }
 });
 
