@@ -11,6 +11,7 @@
 
 import { DOMObserver } from './observer.js';
 import { CONFIG, loadConfig } from '../../lib/config.js';
+import { createBusinessFoundDedupe } from '../../lib/businessFoundGuards.js';
 import { logger } from '../../lib/utils.js';
 
 logger.info('Content script loaded');
@@ -18,6 +19,7 @@ logger.info('Content script loaded');
 // State
 let observer = null;
 let isMonitoring = false;
+const businessFoundDedupe = createBusinessFoundDedupe();
 
 /**
  * Initialize observer
@@ -303,8 +305,11 @@ async function flushPendingBusinesses() {
  * Handle new business found
  */
 function handleNewBusiness(business) {
-    logger.info('New business found:', business.title);
-
+    if (!businessFoundDedupe.shouldSend(business)) {
+        logger.debug('Duplicate business observation suppressed:', business?.title);
+        return;
+    }
+    logger.info('New business found:', business?.title);
     // BLOCK-8 FIX (MED-008): Add retry logic for sendMessage with exponential backoff
     const maxRetries = 3;
     const sendWithRetry = async (attempt = 1) => {
@@ -478,12 +483,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // loadConfig() mutates CONFIG.selectors in place via safeMerge (prototype-
 // pollution-safe), so the captured CONFIG reference sees the overrides.
 //
-// KNOWN LIMITATION (flagged for product decision, see FINDINGS): the settings
-// UI currently exposes title/phone/website/address selector fields, but those
-// keys are NOT consumed anywhere (SelectorEngine uses its own hardcoded
-// strategies; only businessLink/scrollContainer/businessCard are read here).
-// Wiring loadConfig() makes the MECHANISM real for the consumed keys; making
-// the 4 UI fields effective is a separate feature (or they should be removed).
+// KNOWN LIMITATION: only CONFIG.selectors.businessLink is consumed by the content script; scrollContainer and businessCard remain configuration defaults but are not consumed by the current content-script runtime.
 (async () => {
     try {
         await loadConfig();

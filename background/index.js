@@ -43,6 +43,7 @@ import { buildInvalidUrlSkipUpdate, SKIPPED_INVALID_URL, buildCircuitOpenFailure
 // EXACT algorithm the modal displays — one predicate, no client/server drift.
 import { categorizeFailure } from '../lib/failedCategories.js';
 import { normalizeGoogleMapsUrl, getCanonicalDbKey } from '../lib/urlNormalizer.js';
+import { createBusinessFoundTelemetry } from '../lib/businessFoundGuards.js';
 import { enrichmentRetryQueue } from '../lib/enrichmentRetryQueue.js';
 // SAVE-DLQ (2026-05-28): dead-letter recovery for save failures that survive the
 // in-process retry in db.saveBusiness. See docs/feature/fix-area-search-save-error-swallow/rca.md.
@@ -57,6 +58,7 @@ import {
     getDomain
 } from '../lib/utils.js';
 import { JobQueue } from './jobQueue.js';
+import { decideStartAction } from './emailStartDecision.js';
 import { PerformanceMonitor } from './PerformanceMonitor.js';
 import {
     isValidScrapableUrl,
@@ -107,7 +109,6 @@ export function getEnrichmentTelemetry() {
 import { initializeSystemMonitor, stopSystemMonitor, getSystemMonitor } from '../lib/SystemMonitor.js';
 import { getAutoScaler, configureAutoScaler } from '../lib/AutoScaler.js';
 import { container } from '../lib/ServiceContainer.js';
-import { robotsCompliance } from '../lib/RobotsCompliance.js';
 import { validateMessageSender } from './message-validator.js';
 // Step 03-03: Safe merge to prevent prototype pollution on selector config
 import { safeMerge, fillHolesPatch } from '../lib/sanitize.js';
@@ -198,6 +199,15 @@ logger.info('[SERVICE WORKER] Initialization sequence beginning...');
 // Initialize Job Queue and Performance Monitor
 const jobQueue = new JobQueue();
 const performanceMonitor = new PerformanceMonitor();
+const businessFoundTelemetry = createBusinessFoundTelemetry({
+    windowMs: 60_000,
+    onWindow: (report) => {
+        logger.info(`[BUSINESS_FOUND] window=${report.windowStart}-${report.windowEnd} received=${report.received} writes=${report.writes} timeouts=${report.timeouts}`);
+    },
+});
+const businessFoundTelemetryInterval = setInterval(() => {
+    businessFoundTelemetry.tick();
+}, 60_000);
 
 // 2026-05-15 FIX (closure-jobs not persistable):
 // pre-fix `addEmailJob` and the retry-failed call site used
@@ -216,12 +226,13 @@ const performanceMonitor = new PerformanceMonitor();
 // If the business was deleted between eviction and restore, factory
 // returns null (job becomes a no-op) instead of crashing on a stale
 // snapshot.
-jobQueue.registerJobType('email_scrape', (params) => async () => {
+jobQueue.registerJobType('email_scrape', (params) => async (executionContext) => {
     const key = params?.canonicalUrl;
     if (!key) {
         logger.warn('[JobQueue] email_scrape: missing canonicalUrl in params, skipping');
         return null;
     }
+    executionContext?.onStep?.('business-load');
     const fresh = await getBusiness(key);
     if (!fresh) {
         logger.debug(`[JobQueue] email_scrape: business no longer in DB (deleted between eviction and restore): ${key}`);
@@ -239,7 +250,7 @@ jobQueue.registerJobType('email_scrape', (params) => async () => {
         logger.debug(`[JobQueue] email_scrape: business already enriched (emailScraped=true), skipping: ${key}`);
         return null;
     }
-    return await scrapeEmailForBusiness(fresh);
+    return await scrapeEmailForBusiness(fresh, executionContext);
 });
 
 // Census 2026-08-19 (§5.6): the `offscreenCreating` shadow that lived here was
@@ -490,7 +501,6 @@ async function initialize() {
         container.register('performanceMonitor', performanceMonitor);
         container.register('autoScaler', autoScaler);
         container.register('systemMonitor', getSystemMonitor());
-        container.register('robotsCompliance', robotsCompliance);
 
         logger.info('All core services registered in ServiceContainer');
 
@@ -836,6 +846,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
  * P0-002 FIX: Added timeout guard to prevent calling sendResponse on closed channel
  */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.action === 'business_found') businessFoundTelemetry.recordReceived();
     // P0-002 FIX: Track if response was already sent to prevent double-send
     let responseSent = false;
 
@@ -843,6 +854,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const channelTimeout = setTimeout(() => {
         if (!responseSent) {
             responseSent = true;
+            if (message?.action === 'business_found') businessFoundTelemetry.recordTimeout();
             logger.warn('[MSG] Message channel timeout - handler still processing:', message.action);
             sendResponse({ status: 'timeout', error: 'Handler timeout after 25s' });
         }
@@ -946,7 +958,9 @@ async function handleMessage(message, sender) {
                 return { status: 'alive', type: 'heartbeat', timestamp: Date.now() };
 
             case 'business_found':
-                return await handleBusinessFound(payload);
+                return await handleBusinessFound(payload, {
+                    onWrite: () => businessFoundTelemetry.recordWrite(),
+                });
 
             case 'business_enrichment':
                 // R-DETAIL (2026-05-05): merge 6 CSV-only deep-fields into an
@@ -1663,7 +1677,14 @@ async function handleUrlImport(urls) {
  * Handle new business found
  * AUDIT FIX #6: Normalize URLs to prevent duplicates
  */
-async function handleBusinessFound(business) {
+async function handleBusinessFound(business, telemetryContext = null) {
+    const recordWrite = () => {
+        try {
+            telemetryContext?.onWrite?.();
+        } catch (error) {
+            logger.debug('[BUSINESS_FOUND] write telemetry failed:', error?.message || error);
+        }
+    };
     try {
         // v9.10: lookup MUST use canonical DB key form (`%3A` encoded), not
         // the raw `:` form from `normalizeGoogleMapsUrl` alone — `saveBusiness`
@@ -1702,6 +1723,7 @@ async function handleBusinessFound(business) {
                 (current) => fillHolesPatch(current, business, ['googleMapsUrl'])
             );
             if (wroteKey) {
+                recordWrite();
                 logger.debug('[BUSINESS] Duplicate back-filled (fill-holes):', business.title);
                 return { status: 'duplicate', merged: true, id: normalizedUrl };
             }
@@ -1729,6 +1751,7 @@ async function handleBusinessFound(business) {
         // fill → no write (wroteKey === null). Report that as a duplicate so
         // handleBusinessBatch's saved/duplicate counters stay truthful.
         const inserted = wroteKey != null;
+        if (inserted) recordWrite();
         logger.info(inserted ? '[BUSINESS] Saved:' : '[BUSINESS] Raced to existing (no-op):', business.title);
         logger.info('[STEP 3] Email saved. Moving to next job...');
 
@@ -1967,11 +1990,41 @@ async function startEmailScraping() {
     }
     _emailStartInFlight = true;
     try {
-        // Check if scraping is already in progress
         const queueStatus = jobQueue.getStatus();
-        if (queueStatus.active > 0 || queueStatus.pending > 0) {
+        // Active jobs are the only proof that a worker is currently running.
+        const startAction = decideStartAction(queueStatus);
+        if (startAction === 'reject_running') {
             logger.warn(`Email scraping already in progress. ${queueStatus.pending} pending, ${queueStatus.active} active jobs.`);
             return { status: 'already_running', pending: queueStatus.pending, active: queueStatus.active };
+        }
+        if (startAction === 'paused') {
+            logger.info(`Email scraping remains paused. ${queueStatus.pending} pending jobs.`);
+            return { status: 'paused', pending: queueStatus.pending, active: queueStatus.active };
+        }
+        if (startAction === 'circuit_open') {
+            logger.info(`Email scraping held by circuit breaker. ${queueStatus.pending} pending jobs.`);
+            return { status: 'circuit_open', pending: queueStatus.pending, active: queueStatus.active };
+        }
+        if (startAction === 'resume_wedged') {
+            if (!jobQueue.forceRestartWorkers()) {
+                const currentStatus = jobQueue.getStatus();
+                if (currentStatus.active > 0) {
+                    return { status: 'already_running', pending: currentStatus.pending, active: currentStatus.active };
+                }
+                if (currentStatus.circuitOpen) {
+                    return { status: 'circuit_open', pending: currentStatus.pending, active: currentStatus.active };
+                }
+                if (currentStatus.isPaused) {
+                    return { status: 'paused', pending: currentStatus.pending, active: currentStatus.active };
+                }
+                logger.warn('Email scraping worker restart could not start.');
+                return { status: 'resume_failed', pending: currentStatus.pending, active: currentStatus.active };
+            }
+            startKeepAlive('email-scraping');
+            _startPhase2Heartbeat();
+            const resumedStatus = jobQueue.getStatus();
+            logger.info(`Email scraping workers resumed. ${resumedStatus.pending} pending, ${resumedStatus.active} active jobs.`);
+            return { status: 'resumed', pending: resumedStatus.pending, active: resumedStatus.active };
         }
 
         logger.info('Starting email scraping...');
@@ -2193,7 +2246,7 @@ function addEmailJob(business) {
  * Wrapper: Scrape email for business using email-scraper module
  * Adapts the module function to work with local context
  */
-async function scrapeEmailForBusiness(business) {
+async function scrapeEmailForBusiness(business, executionContext = null) {
     // BG-5: register THIS worker's target so the concurrent broadcast
     // can show all active items rather than overwriting a shared global.
     // The url is unique per business → safe map key under concurrency.
@@ -2211,7 +2264,8 @@ async function scrapeEmailForBusiness(business) {
     // Call module function with wrapper
     logger.info('[DEBUG_UI] Calling scrapeEmailForBusinessModule from index.js');
     try {
-        const result = await scrapeEmailForBusinessModule(business, name, parseWrapper);
+        const result = await scrapeEmailForBusinessModule(business, name, parseWrapper, executionContext);
+        executionContext?.onStep?.('result-handling');
         return await _scrapeEmailForBusinessHandleResult(result, business, url);
     } finally {
         // BG-5: always clear this worker's slot on completion / error.
@@ -3275,6 +3329,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 const SUSPEND_BUDGET_MS = 4000;
 chrome.runtime.onSuspend?.addListener?.(() => {
     logger.info('[SHUTDOWN] Service worker suspending, persisting state...');
+    clearInterval(businessFoundTelemetryInterval);
+    businessFoundTelemetry.flush();
     // NOTE: we deliberately do NOT mark the listener `async`. Returning
     // void here is more honest about Chrome's actual contract — there is
     // no awaiter on the other side. The IIFE below runs but Chrome may

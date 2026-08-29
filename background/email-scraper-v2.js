@@ -39,7 +39,6 @@ import { getAutoScaler } from '../lib/AutoScaler.js';
 import { getSystemMonitor } from '../lib/SystemMonitor.js';
 import { scrapeWithTab, shouldRetryWithTab, setCircuitHooks } from './TabScraperFallback.js';
 import { container } from '../lib/ServiceContainer.js';
-import { robotsCompliance } from '../lib/RobotsCompliance.js';
 
 // §3.D.3 CYCLE BREAK (2026-06-11): inject the per-domain circuit-breaker
 // hooks into TabScraperFallback instead of letting it import this module
@@ -101,9 +100,6 @@ logger.info(`[EmailScraper] Navigation Hooks enabled with ${navigationHooks.post
 // — NOT here, to preserve restoreFromStorage semantics (B4-1 fix).
 if (!container.has('navigationHooks')) {
     container.register('navigationHooks', navigationHooks);
-}
-if (!container.has('robotsCompliance')) {
-    container.register('robotsCompliance', robotsCompliance);
 }
 logger.info('[EmailScraper] Dependencies registered in ServiceContainer');
 
@@ -1134,27 +1130,6 @@ function _accountedFetchError(message) {
     return err;
 }
 
-/**
- * R4 / M14-bis (2026-08-18): robots outcome SSOT.
- *
- * ROBOTS_TXT_DISALLOWED is the message of the per-page error the robots gate
- * in fetchWebsiteHTML throws BEFORE the try block — so it never reaches the
- * fetch catch (no markBad / recordCircuitFailure / AutoScaler accounting; the
- * original M14 "counted as system-failure" finding is REFUTED by this layout).
- *
- * ROBOTS_DISALLOWED_MARKER is the scrapedFrom/scrapeError value stamped on the
- * business row when a scrape ends email-less with a robots disallow as its
- * final error — same lowercase honesty convention as 'cloudflare_protected',
- * 'circuit_open' (S8) and 'skipped_invalid_url' (BUG-7). deriveScrapeStatus
- * surfaces it as 'scrape_failed' (visible, never success/no_email). robots
- * disallow is a PERMANENT-LEGITIMATE outcome in the S8 taxonomy: the job
- * completes (retrying a policy is futile), but NEVER silently — the marker is
- * mandatory — and the domain circuit breaker stays NEUTRAL (a disallow is not
- * evidence the domain is failing, nor a "success" that should reset real
- * failure counts).
- */
-export const ROBOTS_TXT_DISALLOWED = 'ROBOTS_TXT_DISALLOWED';
-export const ROBOTS_DISALLOWED_MARKER = 'robots_disallowed';
 
 /**
  * Fetch website HTML with timeout, session tracking, and statistics
@@ -1177,24 +1152,9 @@ export async function fetchWebsiteHTML(url, pageContext = null) {
         FETCH_TIMEOUT
     );
 
-    // R12 (TIER A): obtain session headers FIRST so the robots.txt fetch and the
-    // page fetch share one identity. Previously robots.txt was probed as
-    // 'GhostMapProBot' while the page was fetched as Chrome — two faces to one
-    // origin, a trivial anti-correlation signal for any defensive site.
     const { headers, sessionId } = await getSessionHeaders();
     const domain = new URL(url).hostname;
 
-    // M8-MISS2 + R12: robots.txt check uses the SAME User-Agent as the page fetch.
-    // R3: strictMode behavior is governed by CONFIG.robotsCompliance.strictMode.
-    const robotsChecker = container.has('robotsCompliance')
-        ? container.get('robotsCompliance')
-        : robotsCompliance;
-    const isAllowed = await robotsChecker.isAllowed(url, { headers });
-    if (!isAllowed) {
-        clearTimeout(timeoutId);
-        logger.info(`[ROBOTS] Blocked by robots.txt: ${url}`);
-        throw new Error(ROBOTS_TXT_DISALLOWED);
-    }
 
     // Build hook context
     const hookContext = {
@@ -1455,9 +1415,12 @@ export async function fetchWebsiteHTML(url, pageContext = null) {
  *   retryAfterMs = residual breaker cooldown) when the domain circuit is open —
  *   the JobQueue retries it instead of counting a silent success.
  */
-export async function scrapeEmailForBusiness(business, currentBusinessName, parseHTMLInOffscreenWrapper) {
+export async function scrapeEmailForBusiness(business, currentBusinessName, parseHTMLInOffscreenWrapper, executionContext = null) {
     const startTime = Date.now();
-
+    const markScrapeStep = step => {
+        executionContext?.onStep?.(step);
+        logger.debug(`[SCRAPE STEP] ${business.title}: ${step}`);
+    };
     // HIGH-001 FIX: Removed useless currentBusinessName assignment
     // (JS passes strings by value, reassignment has no effect on caller)
 
@@ -1505,8 +1468,10 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
     //       job — the main result is still saved with lastError.
     //   The gate deliberately does NOT recordCircuitFailure: hitting a closed
     //   gate is not new evidence against the domain (no self-feeding).
+    markScrapeStep('circuit-gate');
     if (await isCircuitOpen(domain)) {
         const duration = Date.now() - startTime;
+        markScrapeStep('circuit-retry-after');
         const retryAfterMs = await getCircuitRetryAfterMs(domain);
         logger.warn(`[CIRCUIT] ⏭️ ${business.title} - domain ${domain} is circuit-open, retry-eligible in ~${Math.round(retryAfterMs / 1000)}s`);
         _getStats().recordRequest({
@@ -1532,12 +1497,6 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
     let successfulPage = null;
     let lastError = null;
     let blockingErrorOccurred = false; // Track if we hit any CAPTCHA/Cloudflare even if 404s follow
-    // R5-2 FIX (2026-08-19, residuo R4): true quando ALMENO una pagina è stata
-    // fetchata con successo (policy-permessa). Il marker robots_disallowed
-    // afferma "non abbiamo potuto fetchare per policy" — se questa flag è
-    // true, quel claim è falso e il lastError robots va azzerato prima
-    // dell'accounting finale (vedi il clear sopra isRobotsOutcome).
-    let anyPageFetchedClean = false;
 
     try {
         const homepageUrl = business.website;
@@ -1556,16 +1515,6 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
         // Start both operations simultaneously
         const homepageFetchPromise = fetchWebsiteHTML(homepageUrl).catch(err => {
             logger.warn(`[P0 OPTIMIZATION] Homepage fetch failed: ${err.message}`);
-            // R4 / M14-bis: a robots disallow on the homepage MUST survive this
-            // swallow. Pre-fix it vanished here (return null, lastError never
-            // set); when the page loop then had nothing to visit (e.g. the
-            // sitemap only proposed the homepage), the business was saved with
-            // NO marker → export lied 'no_email' and the breaker even recorded
-            // success — a silent dishonest outcome. Seed lastError now; later
-            // page errors legitimately overwrite it, an email found clears it.
-            if (err?.message === ROBOTS_TXT_DISALLOWED) {
-                lastError = err;
-            }
             return null; // Don't fail the whole operation
         });
 
@@ -1575,13 +1524,13 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
         });
 
         // Wait for homepage first (usually faster than sitemap)
+        markScrapeStep('homepage-fetch');
         const homepageHtml = await homepageFetchPromise;
         const homepageFetchTime = Date.now() - speculativeStart;
 
         // Parse homepage IMMEDIATELY while sitemap may still be resolving
         let homepageEmailsFound = false;
         if (homepageHtml) {
-            anyPageFetchedClean = true;   // R5-2: la homepage è stata fetchata (policy-permessa)
             logger.info(`[P0 OPTIMIZATION] ⚡ Homepage fetched in ${homepageFetchTime}ms, parsing while sitemap resolves...`);
 
             // Census 2026-08-19 (§5.7): the Cloudflare re-check that lived here
@@ -1594,6 +1543,7 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
             // would have bypassed that accounting (no _accountedFetchError tag),
             // double-counting in the catch below with the wrong DEFAULT band.
             // Pinned by tests/run-census-dead-code-node.mjs.
+            markScrapeStep('homepage-parse');
             const homepageResult = await parseHTMLInOffscreenWrapper(homepageHtml, homepageUrl);
 
             // Capture Italian tax codes from homepage
@@ -1657,6 +1607,7 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
                     // social platform (or valid P.IVA) written concurrently after
                     // the snapshot is never dropped. The snapshot `business` is only
                     // the fallback if the row was deleted mid-job.
+                    markScrapeStep('speculative-save');
                     await updateBusinessMerge(business.googleMapsUrl, (current) => buildBusinessUpdates({
                         emailList, socialLinks, italianTaxCodes,
                         scrapedFrom: successfulPage || homepageUrl,
@@ -1667,6 +1618,7 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
                     logger.info(`[NEXT] Ready for next business...\n`);
 
                     // Record success and return immediately
+                    markScrapeStep('circuit-success');
                     await recordCircuitSuccess(domain);
                     _getStats().recordBusinessProcessed(true);
                     return {
@@ -1682,6 +1634,7 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
         }
 
         // Now await sitemap results (may already be complete)
+        markScrapeStep('sitemap-discovery');
         const sitemapPages = await sitemapDiscoveryPromise;
 
         if (sitemapPages.length > 0) {
@@ -1701,12 +1654,14 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
             // stopOnFirstSuccess:true a homepage-only scrape dropped the email AND
             // partitaIvaRaw. Persist here via the same atomic merge before returning.
             // BUG-4 #4.3 / BUG-3 #3.1: build against the CURRENT record inside the tx.
+            markScrapeStep('homepage-save');
             await updateBusinessMerge(business.googleMapsUrl, (current) => buildBusinessUpdates({
                 emailList: Array.from(allEmails), socialLinks, italianTaxCodes,
                 scrapedFrom: successfulPage || homepageUrl,
                 existingSocial: current?.social,
                 existingPartitaIva: current?.partitaIva,
             }), business);
+            markScrapeStep('circuit-success');
             await recordCircuitSuccess(domain);
             _getStats().recordBusinessProcessed(true);
             return {
@@ -1787,8 +1742,8 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
 
                 // Fetch HTML
                 logger.info(`[FETCH] Downloading HTML...`);
+                markScrapeStep(`page-fetch:${pageNum}`);
                 const html = await fetchWebsiteHTML(currentPage);
-                anyPageFetchedClean = true;   // R5-2: fetch riuscito = policy-permesso
                 const pageSize = html.length;
                 logger.info(`[HTML] Downloaded ${(pageSize / 1024).toFixed(1)} KB`);
 
@@ -1816,6 +1771,7 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
 
                 // Parse HTML and extract emails
                 logger.info(`[PARSE] Transforming HTML to DOM...`);
+                markScrapeStep(`page-parse:${pageNum}`);
                 const result = await parseHTMLInOffscreenWrapper(html, currentPage);
                 logger.info(`✓ [EXTRACT] Extraction complete`);
 
@@ -1837,7 +1793,6 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
                         logger.info(`[ITALIAN B2B] ✓ Found C.F.: ${italianTaxCodes.codiceFiscale}`);
                     }
                 }
-
                 // Store social links early too (BUG-3: accumulate found values
                 // across pages; the old `length === 0` guard was defeated by the
                 // parser's null-filled homepage object and dropped later finds,
@@ -1992,6 +1947,7 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
 
             // BUG-4: atomic merge so a Cloudflare hit on a re-scrape marks the
             // row scraped without regressing enrichment written during the job.
+            markScrapeStep('cloudflare-save');
             await updateBusinessMerge(business.googleMapsUrl, cloudflareUpdates, business);
 
             return {
@@ -2038,6 +1994,7 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
         logger.info('');
 
         try {
+            markScrapeStep('tab-fallback');
             const tabResult = await scrapeWithTab(business);
 
             if (tabResult.emails && tabResult.emails.length > 0) {
@@ -2091,34 +2048,6 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
     const emailList = Array.from(allEmails);
     const duration = Date.now() - startTime;
 
-    // R4 / M14-bis (2026-08-18): robots disallow is a PERMANENT policy outcome.
-    // When the scrape ends email-less and the final error is the robots gate's,
-    // stamp the row with the honesty-convention marker (lowercase, like
-    // cloudflare_protected / circuit_open / skipped_invalid_url) instead of the
-    // raw internal constant + generic 'failed'. The job still completes
-    // (S8 taxonomy: PERMANENT-LEGITIMATE — retrying a policy is futile), but
-    // the outcome is visible: deriveScrapeStatus → 'scrape_failed'.
-    // R5-2 FIX (2026-08-19, residuo R4 dalla peer review): il marker robots
-    // afferma "la policy ci ha impedito di fetchare". Se almeno una pagina
-    // policy-permessa È stata fetchata con successo, quel claim è falso: un
-    // esito email-less qui è un onesto no_email (abbiamo scrapato e non
-    // c'erano email), non robots_disallowed. Pre-fix il lastError robots
-    // seminato dal prefetch homepage (o da una pagina disallowed successiva)
-    // non veniva mai azzerato dalle pagine fetchate pulite → riga mislabeled
-    // scrape_failed/robots_disallowed. Il clear è order-independent (flag, non
-    // posizione nel loop) e limitato al SOLO errore robots: gli altri lastError
-    // (404, timeout, Cloudflare…) restano il comportamento pre-esistente.
-    if (anyPageFetchedClean && lastError?.message === ROBOTS_TXT_DISALLOWED) {
-        logger.debug(`[ROBOTS] lastError robots azzerato: almeno una pagina policy-permessa è stata fetchata (claim "non fetchabile" falso)`);
-        lastError = null;
-    }
-    const isRobotsOutcome = emailList.length === 0 &&
-        lastError?.message === ROBOTS_TXT_DISALLOWED;
-    if (isRobotsOutcome) {
-        logger.warn(`[ROBOTS] Outcome for "${business.title}": ${ROBOTS_DISALLOWED_MARKER} (policy, permanent — no retry value)`);
-        lastError = new Error(ROBOTS_DISALLOWED_MARKER);
-        successfulPage = successfulPage || ROBOTS_DISALLOWED_MARKER;
-    }
 
     logger.info(`\n┌────────────────────────────────────────`);
     logger.info(`│ [COMPLETE] Finished processing "${business.title}"`);
@@ -2149,6 +2078,7 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
     // CURRENT record — existingSocial/existingPartitaIva read `current`, so a
     // concurrently-written social platform is not dropped and a run finding only
     // an invalid raw P.IVA does not pollute col 54 when a valid one already exists.
+    markScrapeStep('result-save');
     await updateBusinessMerge(business.googleMapsUrl, (current) => buildBusinessUpdates({
         emailList, socialLinks, italianTaxCodes,
         scrapedFrom: successfulPage, lastError,
@@ -2162,22 +2092,18 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
 
     // FIX-003: Record circuit breaker result
     if (foundEmail) {
+        markScrapeStep('circuit-success');
         await recordCircuitSuccess(domain);
         logger.info(`✓✓✓ [SAVE] Saved ${allEmails.size} email(s) to database`);
         logger.info(`[NEXT] Ready for next business...\n`);
     } else {
         // CRIT-002 FIX: Record circuit result even for empty sites
-        // R4 / M14-bis: robots disallow is NEUTRAL for the breaker — it is not
-        // evidence the domain is failing (pre-fix it fed recordCircuitFailure:
-        // policy → breaker open → CIRCUIT_OPEN retries → mislabeled outcome),
-        // nor a "success" that should reset REAL failures accumulated by other
-        // businesses on the same domain.
-        if (isRobotsOutcome) {
-            logger.debug(`[CIRCUIT] Neutral: robots disallow on ${domain} is policy, not domain health`);
-        } else if (lastError) {
+        if (lastError) {
+            markScrapeStep('circuit-failure');
             await recordCircuitFailure(domain);
         } else {
             // Clean scrape with no emails = site is healthy, reset failure count
+            markScrapeStep('circuit-success');
             await recordCircuitSuccess(domain);
             logger.debug(`[CIRCUIT] ✓ Domain ${domain} healthy (no errors, no emails)`);
         }

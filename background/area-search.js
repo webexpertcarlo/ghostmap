@@ -314,7 +314,18 @@ const GRID_OPTIMIZER = {
     // Early termination thresholds
     MAX_CONSECUTIVE_LOW_YIELD: 3,
     LOW_YIELD_THRESHOLD: 2,             // < 2 new businesses = low yield
-    HIGH_DUPLICATE_THRESHOLD: 0.8       // 80% duplicates
+    HIGH_DUPLICATE_THRESHOLD: 0.8,      // 80% duplicates
+
+    // EMPTY-CELL-01 (2026-08-27): a batch whose searches surfaced NO cards at
+    // all is empty terrain, not an exhausted area — the grid is hex-packed over
+    // a bounding circle, so a coastal province puts several cells in the sea.
+    // Rimini stopped at 18 searches out of 48 on three consecutive sea cells.
+    // Those batches are now NEUTRAL for the saturation counter, which reopens
+    // the failure mode where a systemically broken run (consent wall, network
+    // down, selector rot) never self-terminates because every batch reports
+    // zero. This cap closes it with a distinct reason, so "the area is done"
+    // and "the engine is broken" stop looking identical in the log.
+    MAX_CONSECUTIVE_EMPTY: 8
 };
 
 // =====================================================
@@ -382,6 +393,7 @@ const _TURBO_DEFAULTS = Object.freeze({
     searches: [],
     startTime: null,
     consecutiveLowYield: 0,
+    consecutiveEmpty: 0,   // EMPTY-CELL-01: sibling of consecutiveLowYield
     stats: { businessesFound: 0, withWebsite: 0, withPhone: 0 },
     config: {}
 });
@@ -400,6 +412,7 @@ const _turboInMemory = {
     searches: [],
     startTime: null,
     consecutiveLowYield: 0,
+    consecutiveEmpty: 0,   // EMPTY-CELL-01: sibling of consecutiveLowYield
     stats: { businessesFound: 0, withWebsite: 0, withPhone: 0 },
     config: {},
     openTabs: new Set()
@@ -789,6 +802,7 @@ function resetTurboState() {
     _turboInMemory.isPaused = false;
     _turboInMemory.startTime = null;
     _turboInMemory.consecutiveLowYield = 0;
+    _turboInMemory.consecutiveEmpty = 0;   // EMPTY-CELL-01
     // Census 2026-08-19 (§5.11): the phantom email counter (`with…Email: 0`)
     // was removed from this stats shape — initialized/reset but never
     // incremented (_applyBatchStatsToTurbo omits it: emails arrive in the
@@ -1806,6 +1820,81 @@ async function _waitForDetailFetcherIdle(tabs, timeoutMs, pollMs = 500) {
 }
 
 /**
+ * YIELD-01 (2026-08-27): the per-batch yield the saturation detector consumes.
+ *
+ * `batchStats.saved` counts inserts made by the batch-save path, but every
+ * insert is already performed by the per-card `business_found` path, so it is
+ * structurally 0 and the detector used to stop every run after
+ * MAX_CONSECUTIVE_LOW_YIELD batches regardless of real yield. Real DB growth is
+ * the only honest measure; `batchSaved` survives only as a degraded fallback for
+ * when a count is unavailable, and must never win over an available count.
+ *
+ * Spec & regression gate: tests/run-area-search-yield-counter-node.mjs.
+ *
+ * @param {{dbCountBefore?: number|null, dbCountAfter?: number|null, batchSaved?: number}} args
+ * @returns {number}
+ */
+function _batchYield({ dbCountBefore, dbCountAfter, batchSaved } = {}) {
+    if (Number.isFinite(dbCountBefore) && Number.isFinite(dbCountAfter)) {
+        return Math.max(0, dbCountAfter - dbCountBefore);
+    }
+    return Number.isFinite(batchSaved) ? batchSaved : 0;
+}
+
+/**
+ * EMPTY-CELL-01 (2026-08-27): decide what a finished batch means for early
+ * termination. Pure — takes the two counters in, hands the two counters back,
+ * and names a stop reason or none. `runTurboV3` only assigns the result.
+ *
+ * Three outcomes, and the middle one is the whole point:
+ *
+ *   found > 0, yield >= threshold   the area is still producing        → reset both
+ *   found > 0, yield <  threshold   the area really is exhausted       → advance lowYield
+ *   found === 0                     no cards surfaced at all: empty
+ *                                   terrain, evidence of NEITHER       → advance empty only
+ *
+ * Pre-fix, the third case was folded into the second, so a hex grid over a
+ * coastal province counted its sea cells as saturation and truncated the run
+ * (Rimini: 18 searches of 48). Treating those batches as neutral removes the
+ * only bound on a systemically broken run, hence MAX_CONSECUTIVE_EMPTY with a
+ * DISTINCT reason — "saturated" and "broken" must not share a log line.
+ *
+ * A sea cell must not reset the low-yield streak either: a saturating sweep
+ * interrupted by one empty cell is still a saturating sweep.
+ *
+ * Spec & regression gate: tests/run-area-search-yield-verdict-node.mjs.
+ *
+ * @param {{found?: number, newBusinesses?: number, consecutiveLowYield?: number, consecutiveEmpty?: number}} args
+ * @returns {{consecutiveLowYield: number, consecutiveEmpty: number, stop: null|'saturated'|'empty'}}
+ */
+function _yieldVerdict({ found, newBusinesses, consecutiveLowYield, consecutiveEmpty } = {}) {
+    const prevLow = Number.isFinite(consecutiveLowYield) ? consecutiveLowYield : 0;
+    const prevEmpty = Number.isFinite(consecutiveEmpty) ? consecutiveEmpty : 0;
+    const cards = Number.isFinite(found) ? found : 0;
+    const yielded = Number.isFinite(newBusinesses) ? newBusinesses : 0;
+
+    if (cards === 0) {
+        const empty = prevEmpty + 1;
+        return {
+            consecutiveLowYield: prevLow,
+            consecutiveEmpty: empty,
+            stop: empty >= GRID_OPTIMIZER.MAX_CONSECUTIVE_EMPTY ? 'empty' : null
+        };
+    }
+
+    if (yielded < GRID_OPTIMIZER.LOW_YIELD_THRESHOLD) {
+        const low = prevLow + 1;
+        return {
+            consecutiveLowYield: low,
+            consecutiveEmpty: 0,
+            stop: low >= GRID_OPTIMIZER.MAX_CONSECUTIVE_LOW_YIELD ? 'saturated' : null
+        };
+    }
+
+    return { consecutiveLowYield: 0, consecutiveEmpty: 0, stop: null };
+}
+
+/**
  * Apply per-batch stats to global TURBO_STATE.
  *
  * H-02: businessesFound counts UNIQUE-SAVED, not raw DOM-extracted, so the
@@ -1890,6 +1979,18 @@ async function runTurboV3() {
         console.log(`\n📦 Batch ${TURBO_STATE.currentBatch + 1}/${TURBO_STATE.totalBatches}`);
 
         let createdTabs = [];  // Track tabs for guaranteed cleanup
+
+        // YIELD-01b (2026-08-27): sampled HERE, before a single tab exists.
+        // The first attempt sampled it at step 5 ("EXTRACT AND SAVE"), by which
+        // point the tabs had already been created, loaded and scrolled and the
+        // content scripts had already written every card of this batch through
+        // the per-card `business_found` path — so before === after and the yield
+        // read 0 on a batch that had really added ~60 rows. Measured on Bologna:
+        // `[OPTIMIZER] Low yield batch (0 new)` three times while the DB grew to
+        // 189, terminating the run at 18 searches of 1161 (1.6% of the grid).
+        // The pure unit test on `_batchYield` could not catch this: the helper
+        // was right, the sampling point was wrong.
+        const dbCountBefore = await dbInstance.countBusinesses().catch(() => null);
 
         try {
             // ===== 1. SAFE TAB CREATION WITH RECOVERY =====
@@ -2009,6 +2110,9 @@ async function runTurboV3() {
             // ===== 5. EXTRACT AND SAVE BUSINESSES =====
             console.log(`  🔍 Extracting businesses from ${createdTabs.length} tabs...`);
             let batchStats = { found: 0, websites: 0, phones: 0, saved: 0, duplicates: 0, errors: 0, quotaFailures: 0, dlqDropped: 0 };
+            // YIELD-01: `dbCountBefore` is sampled at the TOP of the batch
+            // iteration, not here — see the comment at the sampling site. By
+            // this point the per-card saves of this batch have already landed.
             let businessBatch = [];
             // BUG-008 FIX: Use MESSAGE_LIMITS.MAX_BATCH_SIZE instead of hardcoded 20
             const BATCH_SIZE = MESSAGE_LIMITS.MAX_BATCH_SIZE;
@@ -2169,20 +2273,46 @@ async function runTurboV3() {
             // EARLY TERMINATION OPTIMIZATION
             // =====================================================
             // Track consecutive low-yield batches
-            const newBusinesses = batchStats.saved;
+            const dbCountAfter = await dbInstance.countBusinesses().catch(() => null);
+            const newBusinesses = _batchYield({
+                dbCountBefore,
+                dbCountAfter,
+                batchSaved: batchStats.saved
+            });
             const duplicateRate = batchStats.duplicates / Math.max(1, batchStats.saved + batchStats.duplicates);
 
-            if (newBusinesses < GRID_OPTIMIZER.LOW_YIELD_THRESHOLD) {
-                TURBO_STATE.consecutiveLowYield++;
-                console.log(`[OPTIMIZER] Low yield batch (${newBusinesses} new). Consecutive: ${TURBO_STATE.consecutiveLowYield}/${GRID_OPTIMIZER.MAX_CONSECUTIVE_LOW_YIELD}`);
-            } else {
-                TURBO_STATE.consecutiveLowYield = 0;
+            // The saturation decision ends runs, so its inputs are logged, not
+            // inferred. YIELD-01 and YIELD-01b were both diagnosed by reading
+            // `Low yield batch (0 new)` and guessing WHY it was 0; this line
+            // removes the guessing.
+            console.log(`[OPTIMIZER] yield inputs: dbBefore=${dbCountBefore} dbAfter=${dbCountAfter} batchSaved=${batchStats.saved} found=${batchStats.found} => newBusinesses=${newBusinesses}`);
+
+            // EMPTY-CELL-01: a batch that surfaced zero cards is empty terrain,
+            // not an exhausted area. _yieldVerdict keeps the two cases apart.
+            const verdict = _yieldVerdict({
+                found: batchStats.found,
+                newBusinesses,
+                consecutiveLowYield: TURBO_STATE.consecutiveLowYield,
+                consecutiveEmpty: TURBO_STATE.consecutiveEmpty
+            });
+            TURBO_STATE.consecutiveLowYield = verdict.consecutiveLowYield;
+            TURBO_STATE.consecutiveEmpty = verdict.consecutiveEmpty;
+
+            if (batchStats.found === 0) {
+                console.log(`[OPTIMIZER] Empty batch (0 cards surfaced — terrain, not saturation). Consecutive: ${verdict.consecutiveEmpty}/${GRID_OPTIMIZER.MAX_CONSECUTIVE_EMPTY}`);
+            } else if (verdict.consecutiveLowYield > 0) {
+                console.log(`[OPTIMIZER] Low yield batch (${newBusinesses} new). Consecutive: ${verdict.consecutiveLowYield}/${GRID_OPTIMIZER.MAX_CONSECUTIVE_LOW_YIELD}`);
             }
 
-            // Early termination when area is saturated
-            if (TURBO_STATE.consecutiveLowYield >= GRID_OPTIMIZER.MAX_CONSECUTIVE_LOW_YIELD) {
+            // Early termination — saturated area, or an engine that stopped
+            // finding anything anywhere (two different problems, two reasons).
+            if (verdict.stop === 'saturated') {
                 console.log('[OPTIMIZER] 🏁 Early termination: Area saturated');
                 _finishReason = 'saturated'; // forensic #7: honest completion dialog
+                TURBO_STATE.isRunning = false;
+            } else if (verdict.stop === 'empty') {
+                console.log(`[OPTIMIZER] ⛔ Early termination: ${GRID_OPTIMIZER.MAX_CONSECUTIVE_EMPTY} consecutive batches surfaced no cards — check consent wall / selectors, this is not saturation`);
+                _finishReason = 'no_results'; // distinct from 'saturated' on purpose
                 TURBO_STATE.isRunning = false;
             }
 
@@ -3924,6 +4054,8 @@ export { _bindOrphanWindowCleanup };
 // fix-area-search-wrong-center (01-01): pure, rank-preserving Nominatim
 // settlement selection. Exported for tests/run-area-search-geocode-node.mjs.
 export { selectGeocodeResult };
+// YIELD-01 (2026-08-27): exported for tests/run-area-search-yield-counter-node.mjs.
+export { _batchYield, _yieldVerdict };
 // S10 (2026-08-18): exported for tests/run-s10-area-search-captcha-cell-audit-node.mjs.
 // Internal 0-result-cell CAPTCHA audit — NOT public API.
 export { _auditZeroResultCell, CaptchaDetector };

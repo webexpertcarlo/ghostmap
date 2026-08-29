@@ -176,13 +176,7 @@ const elements = {
     settingMaxConcurrent: document.getElementById('settingMaxConcurrent'),
     settingTimeout: document.getElementById('settingTimeout'),
     tabBtns: document.querySelectorAll('.tab-btn'),
-    tabContents: document.querySelectorAll('.tab-content'),
-
-    // FIX: Added selector inputs for custom GMaps selectors
-    selTitle: document.getElementById('selTitle'),
-    selPhone: document.getElementById('selPhone'),
-    selWebsite: document.getElementById('selWebsite'),
-    selAddress: document.getElementById('selAddress')
+    tabContents: document.querySelectorAll('.tab-content')
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -737,11 +731,28 @@ async function startEmailScraping() {
             return;
         }
 
-        if (response && (response.status === 'started' || response.status === 'already_running')) {
+        if (response?.status === 'paused' || response?.status === 'circuit_open') {
+            state.isExtractingEmails = false;
+            updateEmailExtractionUI(false);
+            showToast(response.status === 'paused'
+                ? 'Email extraction is paused'
+                : 'Email extraction paused by circuit breaker', 'warning');
+            return;
+        }
+
+        if (response && (response.status === 'started'
+            || response.status === 'resumed'
+            || response.status === 'already_running')) {
             state.isExtractingEmails = true;
             updateEmailExtractionUI(true);
-            showToast('📧 Email extraction started', 'success');
-            addActivity({ name: 'Email extraction', status: 'success', detail: 'started' });
+            showToast(response.status === 'resumed'
+                ? '📧 Email extraction resumed'
+                : '📧 Email extraction started', 'success');
+            addActivity({
+                name: 'Email extraction',
+                status: 'success',
+                detail: response.status === 'resumed' ? 'resumed' : 'started'
+            });
 
             // If already running, try to resume
             if (response.status === 'already_running') {
@@ -1525,7 +1536,7 @@ function closeSettings() {
 
 async function loadSettings() {
     try {
-        const result = await chrome.storage.local.get(['ghostMapSettings', 'userConfig', 'ghostmap_feature_flags']);
+        const result = await chrome.storage.local.get(['ghostMapSettings', 'ghostmap_feature_flags']);
 
         // SYNC FIX: Defaults now match lib/config.js exactly
         // CONFIG.rateLimits.emailScraping = { maxConcurrent: 5, timeout: 30000, meanDelayMs: 1200 }
@@ -1547,16 +1558,6 @@ async function loadSettings() {
             elements.settingMaxConcurrent.value = CONFIG_DEFAULTS.maxConcurrent;
             elements.settingTimeout.value = CONFIG_DEFAULTS.timeout;
         }
-
-        // FIX: Load Selectors tab settings
-        if (result.userConfig && result.userConfig.selectors) {
-            const sel = result.userConfig.selectors;
-            if (elements.selTitle && sel.title) elements.selTitle.value = sel.title;
-            if (elements.selPhone && sel.phone) elements.selPhone.value = sel.phone;
-            if (elements.selWebsite && sel.website) elements.selWebsite.value = sel.website;
-            if (elements.selAddress && sel.address) elements.selAddress.value = sel.address;
-        }
-
     } catch (error) {
         console.error('[GhostMap] Failed to load settings:', error);
     }
@@ -1570,31 +1571,8 @@ async function saveSettings() {
             maxConcurrent: parseInt(elements.settingMaxConcurrent.value),
             timeout: parseInt(elements.settingTimeout.value)
         };
-
-        // FIX: Collect selector overrides (userConfig format for config.js loadConfig)
-        const selectors = {};
-        if (elements.selTitle && elements.selTitle.value.trim()) {
-            selectors.title = elements.selTitle.value.trim();
-        }
-        if (elements.selPhone && elements.selPhone.value.trim()) {
-            selectors.phone = elements.selPhone.value.trim();
-        }
-        if (elements.selWebsite && elements.selWebsite.value.trim()) {
-            selectors.website = elements.selWebsite.value.trim();
-        }
-        if (elements.selAddress && elements.selAddress.value.trim()) {
-            selectors.address = elements.selAddress.value.trim();
-        }
-
         // Save general settings
         await chrome.storage.local.set({ ghostMapSettings: settings });
-
-        // Save selector overrides (if any) to userConfig for config.js
-        if (Object.keys(selectors).length > 0) {
-            await chrome.storage.local.set({ userConfig: { selectors } });
-            console.log('[GhostMap] Selector overrides saved:', selectors);
-        }
-
         // Notify background to apply settings
         await sendMessageWithTimeout({ action: 'update_settings', settings });
 

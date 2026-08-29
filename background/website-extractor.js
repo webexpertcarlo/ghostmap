@@ -10,6 +10,10 @@
  */
 
 import { logger } from '../lib/utils.js';
+import {
+    classifyExtractionOutcome,
+    GOOGLE_BLOCKED_ERROR_CODE
+} from './websiteExtractionDecision.js';
 // BUG-4 (2026-07-07): updateBusinessMerge replaces the stale-snapshot full put —
 // this worker read `business` before the extraction, so a full put of
 // `{...business, website}` would regress any field enriched meanwhile.
@@ -157,23 +161,39 @@ export async function getWebsiteExtractionStatus() {
 let _runLoopActive = false;
 
 /**
- * Extract websites from Google Maps for businesses that don't have one
- * @returns {Promise<{processed: number, found: number, errors: number}>}
+ * Extract websites from Google Maps for businesses that don't have one.
+ * @param {object} [dependencies] Optional Node-test overrides for the DB and extractor boundaries.
+ * @param {Function} [dependencies.getBusinessesWithoutWebsite]
+ * @param {Function} [dependencies.updateBusinessMerge]
+ * @param {Function} [dependencies.extractWebsiteFromGMB]
+ * @returns {Promise<{processed: number, found: number, errors: number, blocked: number}>}
  */
-export async function extractMissingWebsites() {
+export async function extractMissingWebsites(dependencies = {}) {
     // IDX-01: synchronous check-and-set BEFORE any await — an async state
     // read here would be theater (the UI retry lands in the same tick).
     // Pre-fix a second start ALSO reset shouldStop=false on the live run,
     // cancelling an in-flight user Stop; the guard closes that too.
     if (_runLoopActive) {
         logger.warn('[WEBSITE EXTRACTOR] extraction already running — second start rejected (IDX-01)');
-        return { status: 'already_running', processed: 0, found: 0, errors: 0 };
+        return { status: 'already_running', processed: 0, found: 0, errors: 0, blocked: 0 };
     }
     _runLoopActive = true;
 
     logger.info('[WEBSITE EXTRACTOR] Starting extraction for businesses without websites...');
 
-    const stats = { processed: 0, found: 0, errors: 0 };
+    const stats = { processed: 0, found: 0, errors: 0, blocked: 0 };
+    // Keep the worker loop testable without opening IndexedDB. Production
+    // callers pass no overrides and use the imported implementations.
+    const overrides = dependencies && typeof dependencies === 'object' ? dependencies : {};
+    const getMissingWebsites = typeof overrides.getBusinessesWithoutWebsite === 'function'
+        ? overrides.getBusinessesWithoutWebsite
+        : getBusinessesWithoutWebsite;
+    const mergeBusiness = typeof overrides.updateBusinessMerge === 'function'
+        ? overrides.updateBusinessMerge
+        : updateBusinessMerge;
+    const extractWebsite = typeof overrides.extractWebsiteFromGMB === 'function'
+        ? overrides.extractWebsiteFromGMB
+        : extractWebsiteFromGMB;
 
     // Reset state — eviction-safe via chrome.storage.session.
     // _stateCache is the sync mirror used in the hot worker loop; storage
@@ -187,7 +207,7 @@ export async function extractMissingWebsites() {
 
     try {
         // Get businesses without website (idempotent; survives eviction-respawn)
-        const businesses = await getBusinessesWithoutWebsite();
+        const businesses = await getMissingWebsites();
 
         if (!businesses || businesses.length === 0) {
             logger.info('[WEBSITE EXTRACTOR] No businesses without website found');
@@ -269,12 +289,12 @@ export async function extractMissingWebsites() {
                         }
                     }).catch(() => { });
 
-                    const website = await extractWebsiteFromGMB(business.googleMapsUrl);
+                    const website = await extractWebsite(business.googleMapsUrl);
 
                     if (website) {
                         // BUG-4: atomic merge — write ONLY the discovered website
                         // onto the current record, preserving concurrent enrichment.
-                        await updateBusinessMerge(business.googleMapsUrl, { website }, business);
+                        await mergeBusiness(business.googleMapsUrl, { website }, business);
                         stats.found++;
                         logger.info(`[WEBSITE EXTRACTOR] ✓ Found website: ${website}`);
                     } else {
@@ -291,8 +311,13 @@ export async function extractMissingWebsites() {
                     await sleep(WEBSITE_EXTRACTION_CONFIG.delayBetween);
 
                 } catch (error) {
-                    logger.error(`[WEBSITE EXTRACTOR] Error processing ${business.title}:`, error.message);
-                    stats.errors++;
+                    if (error?.code === GOOGLE_BLOCKED_ERROR_CODE) {
+                        stats.blocked++;
+                        logger.warn(`[WEBSITE EXTRACTOR] Google blocked extraction for ${business.title}`);
+                    } else {
+                        logger.error(`[WEBSITE EXTRACTOR] Error processing ${business.title}:`, error.message);
+                        stats.errors++;
+                    }
 
                     // B5-5 + BG-11: increment THIS worker's streak counter and
                     // abort batch if MAX_CONSECUTIVE_FAILURES hit on this worker.
@@ -337,7 +362,7 @@ export async function extractMissingWebsites() {
             payload: stats
         }).catch(() => { });
 
-        logger.info(`[WEBSITE EXTRACTOR] Complete! Processed: ${stats.processed}, Found: ${stats.found}, Errors: ${stats.errors}`);
+        logger.info(`[WEBSITE EXTRACTOR] Complete! Processed: ${stats.processed}, Found: ${stats.found}, Blocked: ${stats.blocked}, Errors: ${stats.errors}`);
         return stats;
 
     } catch (error) {
@@ -462,6 +487,14 @@ async function extractWebsiteFromGMB(googleMapsUrl) {
 
         // Wait for page load
         await waitForTabLoad(tabId, WEBSITE_EXTRACTION_CONFIG.pageLoadWait);
+        const finalTab = await chrome.tabs.get(tabId);
+        const finalUrl = finalTab?.url;
+        const outcome = classifyExtractionOutcome({ finalUrl });
+        if (outcome === 'blocked') {
+            const error = new Error('Google blocked website extraction');
+            error.code = GOOGLE_BLOCKED_ERROR_CODE;
+            throw error;
+        }
 
         // B5-2 FIX (2026-05-10): wrap chrome.scripting.executeScript in
         // Promise.race so a hung page (CAPTCHA / infinite redirect /

@@ -15,7 +15,13 @@ import { getAutoScaler } from '../lib/AutoScaler.js';
 import { Mutex } from '../lib/mutex.js';
 import { getSystemMonitor } from '../lib/SystemMonitor.js';
 import { createSessionState } from '../lib/swState.js';
-
+import {
+    DEFAULT_ACTIVE_JOB_MAX_AGE_MS,
+    DEFAULT_ACTIVE_JOB_REAPER_INTERVAL_MS,
+    DEFAULT_JOB_TIMEOUT_MS,
+    findStaleActiveJobs,
+    startTimedOperation
+} from './jobExecutionSafety.js';
 // BG-7 FIX (2026-05-10): module-scope persisted circuit-breaker state for
 // the JobQueue. Pre-fix `this.consecutiveFailures`, `this.circuitOpen`,
 // `this.circuitOpenTime` were constructor-instance fields. On SW eviction
@@ -151,8 +157,23 @@ export class JobQueue {
         this.backoffMax = options.backoffMax ?? 30000; // 30 seconds max
         this.backoffJitterPercent = options.backoffJitterPercent ?? 0.25; // ±25% jitter
 
+        this.jobTimeoutMs = options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS;
+        this.activeJobMaxAgeMs = options.activeJobMaxAgeMs ?? DEFAULT_ACTIVE_JOB_MAX_AGE_MS;
+        this.activeJobReaperIntervalMs = options.activeJobReaperIntervalMs ?? DEFAULT_ACTIVE_JOB_REAPER_INTERVAL_MS;
+        if (!Number.isFinite(this.jobTimeoutMs) || this.jobTimeoutMs <= 0) {
+            throw new RangeError('jobTimeoutMs must be a positive finite number');
+        }
+        if (!Number.isFinite(this.activeJobMaxAgeMs) || this.activeJobMaxAgeMs <= 0) {
+            throw new RangeError('activeJobMaxAgeMs must be a positive finite number');
+        }
+        if (!Number.isFinite(this.activeJobReaperIntervalMs) || this.activeJobReaperIntervalMs < 0) {
+            throw new RangeError('activeJobReaperIntervalMs must be a non-negative finite number');
+        }
+
         // BGW-H2 FIX: Timer registry to prevent orphaned timers
         this._pendingTimers = new Set();
+        this._activeOperations = new Map();
+        this._activeJobReaperInterval = null;
 
         // S7 FIX (2026-08-18): ids of jobs currently in a retry-backoff
         // window (retry timer scheduled, job neither in queue nor in
@@ -195,6 +216,7 @@ export class JobQueue {
 
         // M4-MISS2: Periodic cleanup of stale domainTokens (every 10 minutes)
         this._domainTokenCleanupInterval = setInterval(() => this.cleanupStaleDomainTokens(), 10 * 60 * 1000);
+        this._startActiveJobReaper();
 
         logger.info(`[JobQueue] 🚀 Initialized with Crawlee features: sameDomainDelay=${this.sameDomainDelayMs}ms, backoffMax=${this.backoffMax}ms`);
         // Forensic #9 (2026-06-11): read the live scaler instead of the old
@@ -278,9 +300,35 @@ export class JobQueue {
         this.isPaused = false;
         this._stoppedByCircuit = false; // F1: fresh start clears circuit-halt intent
         this._cancellationRequested = false; // M2-RACE1: Reset cancellation on start
+        this._startActiveJobReaper();
         logger.info('Job queue started');
 
         this._processQueue();
+    }
+
+    /**
+     * Restart workers for jobs that are already queued but no longer running.
+     * This deliberately refuses paused, circuit-open, active, empty, or
+     * mutex-held queues so a recovery request cannot override lifecycle state.
+     * @returns {boolean} whether the worker loop was restarted
+     */
+    forceRestartWorkers() {
+        if (this.isPaused || this.circuitOpen || this._stoppedByCircuit) {
+            logger.warn('[QUEUE] Worker restart refused: queue is paused or circuit-open');
+            return false;
+        }
+        if (this.activeJobs.size > 0 || this.queue.length === 0) return false;
+        if (this.mutex.isLocked()) {
+            logger.warn('[QUEUE] Worker restart refused: queue mutex is locked');
+            return false;
+        }
+
+        // Clear stale worker-start state. Jobs remain in this.queue.
+        this.isProcessing = false;
+        this._cancellationRequested = false;
+        this._jobsAddedDuringProcessing = false;
+        this.start();
+        return true;
     }
 
     /**
@@ -327,6 +375,7 @@ export class JobQueue {
         this._jobsAddedDuringProcessing = false; // M4-BUG1: Reset dirty flag on stop
         this._stoppedByCircuit = false; // F1: a plain stop() is NOT a circuit halt
         this._cancellationRequested = true; // M2-RACE1: Signal addJobsInBatches to stop
+        this._stopActiveJobReaper();
 
         // BGW-H2 FIX: Clear all pending timers
         this._clearPendingTimers();
@@ -474,6 +523,62 @@ export class JobQueue {
         this._pendingTimers.clear();
         if (count > 0) {
             logger.info(`[JobQueue] 🧹 Cleared ${count} pending timers`);
+        }
+    }
+
+    _startActiveJobReaper() {
+        if (this._activeJobReaperInterval || this.activeJobReaperIntervalMs === 0) return;
+        this._activeJobReaperInterval = setInterval(
+            () => this._reapStaleActiveJobs(),
+            this.activeJobReaperIntervalMs
+        );
+        this._activeJobReaperInterval.unref?.();
+    }
+
+    _stopActiveJobReaper() {
+        if (!this._activeJobReaperInterval) return;
+        clearInterval(this._activeJobReaperInterval);
+        this._activeJobReaperInterval = null;
+    }
+
+    _reapStaleActiveJobs() {
+        const staleJobs = findStaleActiveJobs(this.activeJobs, {
+            now: Date.now(),
+            maxAgeMs: this.activeJobMaxAgeMs
+        });
+
+        for (const job of staleJobs) {
+            if (this.activeJobs.get(job.id) !== job) continue;
+            const tracked = this._activeOperations.get(job.id);
+            if (tracked?.job === job && tracked.attemptToken === job._activeAttemptToken) {
+                if (tracked.operation.expire()) {
+                    logger.warn(`[JobQueue] JOB_TIMEOUT reaper expired ${job.id} (last step: ${job.lastStep || 'unknown'})`);
+                }
+                continue;
+            }
+
+            logger.warn(`[JobQueue] Recovering stale untracked active job ${job.id}`);
+            if (tracked) this._activeOperations.delete(job.id);
+            job._activeAttemptToken = null;
+            this.activeJobs.delete(job.id);
+            this._unpersistActiveJob(job.id);
+            const retries = job.retries || 0;
+            const maxRetries = job.maxRetries ?? CONFIG.errors.maxRetries;
+            if (retries < maxRetries) {
+                job.retries = retries + 1;
+                job.startedAt = null;
+                this.stats.retried++;
+                if (!this.queue.some(queued => queued.id === job.id)) this.queue.unshift(job);
+                if (!this.isProcessing && !this.isPaused && !this.circuitOpen) this.start();
+            } else {
+                this.stats.processed++;
+                this.stats.failed++;
+                const error = `JOB_TIMEOUT: stale untracked job ${job.id}`;
+                this.failedJobs.push({ ...job, error, failedAt: Date.now() });
+                this._enforceFailedJobsCap();
+                this._unindexJob(job);
+                this.onJobFailed?.(job, { message: error, stack: 'No stack trace' });
+            }
         }
     }
 
@@ -742,10 +847,12 @@ export class JobQueue {
 
                     // Increment burst counter
                     this.requestsInBurst++;
-
-                    // FIX: Track job in activeJobs SYNCHRONOUSLY before async execution
-                    // This prevents race condition where queue reports empty before job starts
-                    // JQ-01: store the job OBJECT (keyed by id) so saveQueue() can serialize it.
+                    // Track dispatch time and attempt identity on the same object
+                    // held by activeJobs before starting asynchronous execution.
+                    const attemptToken = {};
+                    job._activeAttemptToken = attemptToken;
+                    job.startedAt = Date.now();
+                    job.lastStep = null;
                     this.activeJobs.set(job.id, job);
 
                     // B6-1: Persist active job to chrome.storage.session so it survives
@@ -753,7 +860,7 @@ export class JobQueue {
                     this._persistActiveJob(job);
 
                     // Execute job (async, runs in background)
-                    this._executeJob(job);
+                    this._executeJob(job, attemptToken);
 
                     // AUDIT FIX #8: Gaussian delay for natural timing
                     const delay = this._getGaussianDelay();
@@ -790,34 +897,54 @@ export class JobQueue {
     /**
      * Execute individual job
      */
-    async _executeJob(job) {
+    async _executeJob(job, attemptToken = job._activeAttemptToken) {
         // NOTE: job.id already added to activeJobs synchronously before this call
 
         // S7 FIX: true when this attempt failed retry-eligible and a backoff
         // timer was scheduled — the finally block must then KEEP the ledger
         // entry (it's the only reference that survives SW eviction).
         let retryScheduled = false;
+        let timedOperation = null;
+        let attemptActive = true;
 
         try {
             // DEFENSIVE FIX: Skip jobs with invalid functions (can happen from deserialization)
             if (typeof job.fn !== 'function') {
                 logger.warn(`[JobQueue] Skipping job ${job.id} - function not valid (got ${typeof job.fn}). Removing from queue.`);
-                this.activeJobs.delete(job.id);
-                // B6-1: also remove from active-jobs storage
-                this._unpersistActiveJob(job.id);
-                // Don't retry - just remove silently
+                // The common finally block releases active state and indexes.
                 return;
             }
 
-            // CRAWLEE FEATURE 1.3: Respect same-domain delay
-            if (job.domain) {
-                await this._respectSameDomainDelay(job.domain);
-            }
+            const executionContext = {
+                onStep: step => {
+                    if (attemptActive
+                        && job._activeAttemptToken === attemptToken
+                        && typeof step === 'string'
+                        && step) {
+                        job.lastStep = step;
+                    }
+                }
+            };
+            timedOperation = startTimedOperation(async () => {
+                // CRAWLEE FEATURE 1.3: Respect same-domain delay
+                if (job.domain) await this._respectSameDomainDelay(job.domain);
+                if (job._activeAttemptToken !== attemptToken) return undefined;
+                logger.debug(`Executing job ${job.id} (attempt ${job.retries + 1}/${job.maxRetries + 1})`);
+                return await job.fn(executionContext);
+            }, {
+                timeoutMs: this.jobTimeoutMs,
+                jobId: job.id,
+                lastStep: () => job.lastStep || null,
+                onTimeout: error => {
+                    attemptActive = false;
+                    logger.error(`[JobQueue] ${error.code}: ${job.id} exceeded ${error.timeoutMs}ms (last step: ${error.lastStep || 'unknown'})`);
+                }
+            });
+            this._activeOperations.set(job.id, { job, attemptToken, operation: timedOperation });
 
-            logger.debug(`Executing job ${job.id} (attempt ${job.retries + 1}/${job.maxRetries + 1})`);
-
-            const result = await job.fn();
-
+            const result = await timedOperation.promise;
+            attemptActive = false;
+            if (job._activeAttemptToken !== attemptToken) return;
             // Success
             this.stats.processed++;
             this.stats.succeeded++;
@@ -827,16 +954,6 @@ export class JobQueue {
             logger.debug(`Job ${job.id} completed successfully`);
 
             // PHASE 2: Record success for AutoScaler adaptive concurrency
-            // R5-5a NOTA CONSCIA (2026-08-19, peer review): anche un job
-            // robots-disallowed arriva qui (post-R4 risolve normalmente —
-            // tassonomia S8 PERMANENTE-LEGITTIMO) e viene contato success.
-            // Deliberato: il success-rate dell'AutoScaler misura la salute
-            // dell'INFRASTRUTTURA (possiamo sostenere più concorrenza?), e un
-            // disallow è un fetch di robots.txt riuscito + zero segnali di
-            // stress (niente 429/timeout/blocchi) — non è un guasto. Escluderlo
-            // richiederebbe di ispezionare il result shape di esv2 qui
-            // (accoppiamento) per correggere un bias di costo trascurabile;
-            // il breaker di dominio resta comunque NEUTRO (vedi esv2 R4).
             this.autoScaler.recordResult(true, { domain: job.domain });
 
             if (this.onJobComplete) {
@@ -844,6 +961,8 @@ export class JobQueue {
             }
 
         } catch (error) {
+            attemptActive = false;
+            if (job._activeAttemptToken !== attemptToken) return;
             // PHASE 4 FIX #39: Use standardized error serialization
             const serialized = serializeError(error);
             const errorMessage = serialized.message;
@@ -974,7 +1093,17 @@ export class JobQueue {
                 }
             }
         } finally {
-            this.activeJobs.delete(job.id);
+            attemptActive = false;
+            const tracked = this._activeOperations.get(job.id);
+            if (tracked?.job === job && tracked.attemptToken === attemptToken && tracked.operation === timedOperation) {
+                this._activeOperations.delete(job.id);
+            }
+            const releasedCurrentAttempt = this.activeJobs.get(job.id) === job
+                && job._activeAttemptToken === attemptToken;
+            if (releasedCurrentAttempt) {
+                this.activeJobs.delete(job.id);
+                job._activeAttemptToken = null;
+            }
             // B6-1: also remove from active-jobs storage so it isn't re-queued
             // as orphaned on next loadQueue (post-eviction).
             // S7 FIX: EXCEPT while a retry backoff is pending — the ledger
@@ -984,23 +1113,25 @@ export class JobQueue {
             // early-exit), so the business becomes enqueueable again (e.g.
             // Retry Failed). During a backoff window the key stays claimed:
             // the timer re-add is the SAME job, not a duplicate.
-            if (!retryScheduled) {
+            if (releasedCurrentAttempt && !retryScheduled) {
                 this._unpersistActiveJob(job.id);
                 this._unindexJob(job);
             }
 
-            // PHASE 2 FIX: Trigger AutoScaler evaluation after each job
-            // IMPROVEMENT: Pass system status for system-aware scaling
-            const systemStatus = getSystemMonitor().getStatus();
-            this.autoScaler.evaluate(systemStatus);
+            if (releasedCurrentAttempt) {
+                // PHASE 2 FIX: Trigger AutoScaler evaluation after each job
+                // IMPROVEMENT: Pass system status for system-aware scaling
+                const systemStatus = getSystemMonitor().getStatus();
+                this.autoScaler.evaluate(systemStatus);
 
-            // H-3 FIX: Check if this was the LAST job and queue is empty
-            // The main loop may have exited before this job completed,
-            // so we need to trigger onQueueEmpty callback here
-            if (this.queue.length === 0 && this.activeJobs.size === 0 && !this.isProcessing) {
-                logger.info('[QUEUE] Last job completed, triggering queue empty callback');
-                if (this.onQueueEmpty) {
-                    this.onQueueEmpty();
+                // H-3 FIX: Check if this was the LAST job and queue is empty
+                // The main loop may have exited before this job completed,
+                // so we need to trigger onQueueEmpty callback here
+                if (this.queue.length === 0 && this.activeJobs.size === 0 && !this.isProcessing) {
+                    logger.info('[QUEUE] Last job completed, triggering queue empty callback');
+                    if (this.onQueueEmpty) {
+                        this.onQueueEmpty();
+                    }
                 }
             }
         }
@@ -1486,7 +1617,7 @@ export class JobQueue {
                     maxRetries: job.maxRetries || CONFIG.errors.maxRetries,
                     addedAt: job.addedAt,
                     domain: job.domain,
-                    startedAt: Date.now(),
+                    startedAt: Number.isFinite(job.startedAt) ? job.startedAt : Date.now(),
                     persistable: true
                 };
                 await chrome.storage.session.set({
@@ -1908,6 +2039,7 @@ export class JobQueue {
     async shutdown() {
         // M4-MISS3 FIX: Stop active job processing first
         await this.stop();
+        this._stopActiveJobReaper();
 
         // BGW-H2 FIX: Clear pending timers first
         this._clearPendingTimers();
