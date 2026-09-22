@@ -149,6 +149,7 @@ const elements = {
     previewPhones: document.getElementById('previewPhones'),
     exportCsvBtn: document.getElementById('exportCsvBtn'),
     exportMdBtn: document.getElementById('exportMdBtn'),
+    exportXlsxFilteredBtn: document.getElementById('exportXlsxFilteredBtn'),
     viewFailedBtn: document.getElementById('viewFailedBtn'),
     failedBadge: document.getElementById('failedBadge'),
     resetBtn: document.getElementById('resetBtn'),
@@ -393,6 +394,7 @@ function setupEventListeners() {
     // Phase 3: Export
     elements.exportCsvBtn.addEventListener('click', exportCSV);
     elements.exportMdBtn.addEventListener('click', exportMD);
+    elements.exportXlsxFilteredBtn?.addEventListener('click', exportXlsxFiltered);
     // Note: viewFailedBtn click is handled by failed-modal.js
     elements.resetBtn.addEventListener('click', confirmReset);
 
@@ -656,7 +658,14 @@ async function startWebsiteExtraction() {
         }
 
     } catch (error) {
-        console.error('[GhostMap] Website extraction failed:', error);
+        // MESSAGE_TIMEOUT is common while SW is busy/waking during Area Search —
+        // toast still informs the user; avoid console.error (Errors badge noise).
+        const msg = error?.message || '';
+        if (msg.includes('MESSAGE_TIMEOUT')) {
+            console.debug('[GhostMap] Website extraction timed out (background busy):', msg);
+        } else {
+            console.error('[GhostMap] Website extraction failed:', error);
+        }
         showToast('Website extraction failed', 'error');
         elements.extractWebsitesBtn.disabled = false;
         elements.extractWebsitesBtn.innerHTML = `
@@ -1412,6 +1421,41 @@ async function exportMD() {
     } catch (error) {
         console.error('[GhostMap] MD Export failed:', error);
         showToast('Export failed: ' + error.message, 'error');
+    } finally {
+        hideLoading();
+    }
+}
+
+/**
+ * Same CSV source as Export CSV, then run the ledger pipeline
+ * (dedupe / owner vs generic / no-website / follow-up) and download .xlsx.
+ * Export CSV and Export MD are unchanged.
+ */
+async function exportXlsxFiltered() {
+    showLoading('Building filtered Excel…');
+    try {
+        if (!window.GhostMapLedger?.buildAndDownloadXlsx) {
+            throw new Error('Excel ledger module not loaded');
+        }
+        const response = await sendMessageWithTimeout({ action: 'export_data' }, 120000);
+        if (response?.status !== 'success' || !response.csv) {
+            throw new Error(response?.error || 'Export failed');
+        }
+        const { stats } = await window.GhostMapLedger.buildAndDownloadXlsx(
+            response.csv,
+            `ghost_map_ledger_${Date.now()}`
+        );
+        const unique = stats?.uniqueTotal ?? 0;
+        const dups = stats?.duplicateCount ?? 0;
+        const discarded = response.discarded || 0;
+        const baseMsg = `📗 Excel ledger: ${unique} unique` + (dups ? `, ${dups} duplicates` : '');
+        showToast(
+            discarded > 0 ? `${baseMsg} (${discarded} out of radius discarded)` : baseMsg,
+            'success'
+        );
+    } catch (error) {
+        console.error('[GhostMap] XLSX filtered export failed:', error);
+        showToast('Excel export failed: ' + (error?.message || error), 'error');
     } finally {
         hideLoading();
     }

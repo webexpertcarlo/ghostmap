@@ -879,9 +879,10 @@ async function createTab(url, config) {
         // B5-3 fix: popup window instead of tab in user's main window.
         // 2026-05-15 FIX #3: Chrome rejects off-screen bounds (50% must
         // be visible) AND throttles JS in minimized windows. Landing
-        // zone: 200×200 at (0,0), focused:false. createUnfocusedScrapeWindow
-        // also re-focuses the user's prior normal window so the popup does
-        // not stay visually on top (Windows z-order).
+        // zone: 200×200 at (0,0), focused:false. Same as Area Search:
+        // restoreFocus:false — re-focusing the last Chrome window (Ghost Map
+        // host) steals the user from Cursor/other apps; Chrome cannot restore
+        // OS focus outside Chrome. Extraction behavior unchanged.
         const popupWindow = await createUnfocusedScrapeWindow({
             url,
             type: 'popup',
@@ -889,7 +890,7 @@ async function createTab(url, config) {
             top: 0,
             width: 200,
             height: 200
-        });
+        }, { restoreFocus: false });
 
         const innerTab = popupWindow.tabs?.[0];
         if (!innerTab?.id) {

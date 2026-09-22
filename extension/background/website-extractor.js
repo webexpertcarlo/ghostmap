@@ -471,8 +471,8 @@ async function extractWebsiteFromGMB(googleMapsUrl) {
         // a small popup briefly appears in the top-left corner per
         // business. Better than a broken fallback.
         // Pragmatic landing zone: small 200×200 popup at (0,0). JS runs at
-        // full throttle (normal state). createUnfocusedScrapeWindow keeps
-        // the user's prior normal window in front after create.
+        // full throttle (normal state). restoreFocus:false — same as Area
+        // Search; do not yank Ghost Map Chrome to the front after each popup.
         const popupWindow = await createUnfocusedScrapeWindow({
             url: googleMapsUrl,
             type: 'popup',
@@ -480,7 +480,7 @@ async function extractWebsiteFromGMB(googleMapsUrl) {
             top: 0,
             width: 200,
             height: 200
-        });
+        }, { restoreFocus: false });
         windowId = popupWindow.id;
         tabId = popupWindow.tabs?.[0]?.id;
 
