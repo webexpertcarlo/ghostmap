@@ -1159,6 +1159,9 @@ async function startTurboV3(config) {
 
     console.log(`📦 ${totalBatches} batches, ~${Math.ceil(totalBatches * 15 / 60)} minutes`);
 
+    // Emit initial progress so UI has totals/elapsed immediately (display only).
+    try { broadcastProgress(); } catch { /* ignore */ }
+
     // Start
     runTurboV3();
 
@@ -1288,14 +1291,16 @@ async function createTabsWithRecovery(batch) {
             // "active" tab of its window. Chrome does NOT throttle active tabs,
             // so all tabs scroll at full speed in parallel!
             // ═══════════════════════════════════════════════════════════════════
-            // focused:false + restore prior normal window — keep user's work
-            // in front. Popup remains its own window (active tab → no throttle).
+            // focused:false only — do NOT restoreFocus here. Re-focusing the
+            // user's window after every Maps popup backgrounds those windows
+            // and Chrome throttles their JS (scroll stuck, progress stays 0%).
+            // Each popup is still its own active tab so parallel scroll works.
             windowPromise = createUnfocusedScrapeWindow({
                 url: jitteredUrl,
                 type: 'popup',           // Popup window - each is the active tab, no throttling!
                 width: 600,              // Compact size (was causing full-screen windows)
                 height: 400
-            });
+            }, { restoreFocus: false });
 
             const timeoutPromise = new Promise((_, reject) =>
                 setTimeout(
@@ -4011,7 +4016,32 @@ async function stopTurbo() {
     resetTurboState(); // CRITICAL: Clear memory on stop
     return { status: 'stopped', cleanedUp: true };
 }
-function getTurboStatus() { return { isRunning: TURBO_STATE.isRunning, isPaused: TURBO_STATE.isPaused, stats: TURBO_STATE.stats }; }
+function getTurboStatus() {
+    // Full progress snapshot for UI polling. Same fields as broadcastProgress
+    // so the modal can refresh live stats even when a long batch is in-flight
+    // (progress used to update only after each batch finished).
+    const elapsed = TURBO_STATE.startTime ? Date.now() - TURBO_STATE.startTime : 0;
+    const current = TURBO_STATE.completedSearches || 0;
+    const total = TURBO_STATE.totalSearches || 0;
+    const percent = total > 0 ? Math.round((current / total) * 100) : 0;
+    const avgTime = current > 0 ? elapsed / current : 2000;
+    const remaining = Math.max(0, (total - current) * avgTime);
+    const batchesTrimmed = TURBO_STATE.batchesTrimmed || 0;
+
+    return {
+        isRunning: TURBO_STATE.isRunning,
+        isPaused: TURBO_STATE.isPaused,
+        stats: TURBO_STATE.stats,
+        current,
+        total,
+        percent,
+        currentBatch: (TURBO_STATE.currentBatch || 0) + batchesTrimmed,
+        totalBatches: (TURBO_STATE.totalBatches || 0) + batchesTrimmed,
+        elapsed: formatDuration(elapsed),
+        remaining: formatDuration(remaining),
+        turboMode: true
+    };
+}
 
 // =====================================================
 // MESSAGE HANDLERS

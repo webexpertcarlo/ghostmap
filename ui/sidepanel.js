@@ -1475,6 +1475,17 @@ async function resetAll() {
         elements.emailCount.textContent = '0';
         elements.websiteCount.textContent = '0';
         if (elements.phoneCount) elements.phoneCount.textContent = '0';
+        if (elements.phaseCounts?.[1]) elements.phaseCounts[1].textContent = '0';
+        if (elements.phaseCounts?.[2]) elements.phaseCounts[2].textContent = '—';
+        if (elements.phaseCounts?.[3]) elements.phaseCounts[3].textContent = '—';
+        if (elements.previewTotal) elements.previewTotal.textContent = '0';
+        if (elements.previewEmails) elements.previewEmails.textContent = '0';
+        if (elements.previewWebsites) elements.previewWebsites.textContent = '0';
+        if (elements.previewPhones) elements.previewPhones.textContent = '0';
+        if (elements.queueCount) elements.queueCount.textContent = '0';
+        if (elements.extractTransition) elements.extractTransition.style.display = 'none';
+        if (elements.failedCount) elements.failedCount.textContent = '0';
+        if (elements.failedBadge) elements.failedBadge.style.display = 'none';
 
         // FIX: Reset email progress bar UI to 0%
         elements.emailProgressBar.style.width = '0%';
@@ -1524,10 +1535,20 @@ async function resetAll() {
         // in another Maps tab) — tell the user instead of claiming success.
         if (resetResponse?.status === 'partial') {
             showToast(resetResponse.message || 'Reset incomplete — close other Ghost Map tabs and retry', 'error');
+            await loadStats(); // show real remaining numbers
         } else if (resetResponse?.status === 'error') {
             showToast('Reset failed — see logs', 'error');
+            await loadStats();
+        } else if (resetResponse?.status === 'timeout' || resetResponse?.status === 'lastError') {
+            showToast('Reset may not have finished — try again or reload the extension', 'warning');
+            await loadStats();
         } else {
             showToast('All data has been reset', 'success');
+            // Confirm UI stays at zero (stats poll can otherwise flash old numbers)
+            await loadStats();
+            if ((state.stats.total || 0) > 0) {
+                showToast('Data still present — close other Ghost Map windows and Reset again', 'warning');
+            }
         }
     } catch (error) {
         console.error('[GhostMap] Reset failed:', error);
